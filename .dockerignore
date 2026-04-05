@@ -1,0 +1,11 @@
+.git
+.gitignore
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+outputs/
+src/latest.pt
+src/best.pt
+dataset/data_64Hz/*
+!dataset/data_64Hz/.gitkeep
