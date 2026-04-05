@@ -17,3 +17,5 @@ src/latest.pt
 src/best.pt
 
 .idea
+/dataset/data_64Hz/.gitkeep
+/outputs/.gitkeep
