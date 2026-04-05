@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -83,11 +83,13 @@ def split_participant_files(
     if manifest_path.exists():
         manifest = load_json(manifest_path)
         if sorted(manifest.get("all_files", [])) == sorted(discovered_rel_paths):
-            return ParticipantSplit(
+            reused_split = ParticipantSplit(
                 train_files=tuple(dataset_root / rel_path for rel_path in manifest["train_files"]),
                 val_files=tuple(dataset_root / rel_path for rel_path in manifest["val_files"]),
                 test_files=tuple(dataset_root / rel_path for rel_path in manifest["test_files"]),
             )
+            _validate_split_integrity(reused_split)
+            return reused_split
 
     if len(file_paths) < 3:
         raise ValueError(
@@ -108,33 +110,106 @@ def split_participant_files(
     train_count, val_count, test_count = counts
     train_files = tuple(sorted(shuffled[:train_count]))
     val_files = tuple(sorted(shuffled[train_count : train_count + val_count]))
-    test_files = tuple(sorted(shuffled[train_count + val_count : train_count + val_count + test_count]))
+    test_files = tuple(
+        sorted(shuffled[train_count + val_count : train_count + val_count + test_count])
+    )
 
     split = ParticipantSplit(
         train_files=train_files,
         val_files=val_files,
         test_files=test_files,
     )
-    manifest = {
+    _validate_split_integrity(split)
+    save_json(
+        build_split_manifest_payload(
+            split=split,
+            dataset_root=dataset_root,
+            all_file_paths=file_paths,
+            seed=seed,
+            ratios={
+                "train": data_config.train_ratio,
+                "val": data_config.val_ratio,
+                "test": data_config.test_ratio,
+            },
+        ),
+        manifest_path,
+    )
+    return split
+
+
+def build_split_manifest_payload(
+    split: ParticipantSplit,
+    dataset_root: Path,
+    all_file_paths: Sequence[Path],
+    seed: int,
+    ratios: Mapping[str, float],
+    window_counts_by_split: Mapping[str, int] | None = None,
+    class_counts_by_split: Mapping[str, Mapping[str, int]] | None = None,
+) -> dict[str, Any]:
+    """Build a split manifest with optional window-level diagnostics."""
+
+    _validate_split_integrity(split)
+    all_rel_paths = [_to_relative_string(path, dataset_root) for path in sorted(all_file_paths)]
+    train_rel_paths = [_to_relative_string(path, dataset_root) for path in split.train_files]
+    val_rel_paths = [_to_relative_string(path, dataset_root) for path in split.val_files]
+    test_rel_paths = [_to_relative_string(path, dataset_root) for path in split.test_files]
+
+    split_sets = {
+        "train": set(train_rel_paths),
+        "validation": set(val_rel_paths),
+        "test": set(test_rel_paths),
+    }
+    assigned_files = split_sets["train"] | split_sets["validation"] | split_sets["test"]
+
+    manifest: dict[str, Any] = {
         "dataset_root": str(dataset_root),
         "seed": seed,
-        "ratios": {
-            "train": data_config.train_ratio,
-            "val": data_config.val_ratio,
-            "test": data_config.test_ratio,
-        },
-        "all_files": discovered_rel_paths,
-        "train_files": [_to_relative_string(path, dataset_root) for path in train_files],
-        "val_files": [_to_relative_string(path, dataset_root) for path in val_files],
-        "test_files": [_to_relative_string(path, dataset_root) for path in test_files],
+        "ratios": dict(ratios),
+        "all_files": all_rel_paths,
+        "train_files": train_rel_paths,
+        "val_files": val_rel_paths,
+        "test_files": test_rel_paths,
         "counts": {
-            "train": len(train_files),
-            "val": len(val_files),
-            "test": len(test_files),
+            "train_files": len(train_rel_paths),
+            "validation_files": len(val_rel_paths),
+            "test_files": len(test_rel_paths),
+        },
+        "integrity": {
+            "no_file_overlap": True,
+            "all_discovered_files_assigned_once": assigned_files == set(all_rel_paths),
         },
     }
-    save_json(manifest, manifest_path)
-    return split
+
+    if window_counts_by_split is not None:
+        manifest["window_counts"] = {
+            split_name: int(window_counts_by_split.get(split_name, 0))
+            for split_name in ("train", "validation", "test")
+        }
+    if class_counts_by_split is not None:
+        manifest["window_class_counts"] = {
+            split_name: {
+                label_name: int(count)
+                for label_name, count in class_counts_by_split.get(split_name, {}).items()
+            }
+            for split_name in ("train", "validation", "test")
+        }
+
+    return manifest
+
+
+def _validate_split_integrity(split: ParticipantSplit) -> None:
+    """Fail fast when any file is assigned to multiple splits."""
+
+    train_set = set(split.train_files)
+    val_set = set(split.val_files)
+    test_set = set(split.test_files)
+
+    if train_set & val_set:
+        raise ValueError("Train and validation splits share participant files.")
+    if train_set & test_set:
+        raise ValueError("Train and test splits share participant files.")
+    if val_set & test_set:
+        raise ValueError("Validation and test splits share participant files.")
 
 
 def _to_relative_string(file_path: Path, dataset_root: Path) -> str:

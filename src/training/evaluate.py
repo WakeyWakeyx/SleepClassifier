@@ -13,8 +13,11 @@ from tqdm.auto import tqdm
 from src.utils import (
     compute_classification_metrics,
     ensure_directory,
+    save_confusion_matrix_csv,
     save_confusion_matrix_figure,
     save_json,
+    save_per_class_metrics_csv,
+    save_summary_metrics_csv,
 )
 
 
@@ -25,11 +28,9 @@ def evaluate_model(
     criterion: nn.Module,
     device: torch.device,
     label_names: Sequence[str],
-    output_dir: Path,
-    artifact_prefix: str,
     split_name: str,
 ) -> dict[str, Any]:
-    """Evaluate a model, save metrics artifacts, and return the metric dictionary."""
+    """Evaluate a model and return a rich metric dictionary."""
 
     model.eval()
     total_loss = 0.0
@@ -64,13 +65,33 @@ def evaluate_model(
     metrics["loss"] = total_loss / total_examples
     metrics["num_examples"] = total_examples
     metrics["split"] = split_name
+    return metrics
+
+
+def save_evaluation_artifacts(
+    metrics: dict[str, Any],
+    label_names: Sequence[str],
+    output_dir: Path,
+    artifact_prefix: str,
+    title: str,
+) -> None:
+    """Persist JSON, CSV, and figure outputs for one evaluation run."""
 
     ensure_directory(output_dir)
     save_json(metrics, output_dir / f"{artifact_prefix}_metrics.json")
+    save_summary_metrics_csv(metrics, output_dir / f"{artifact_prefix}_summary.csv")
+    save_per_class_metrics_csv(
+        metrics["per_class"],
+        output_dir / f"{artifact_prefix}_per_class_metrics.csv",
+    )
+    save_confusion_matrix_csv(
+        matrix=metrics["confusion_matrix"],
+        label_names=label_names,
+        output_path=output_dir / f"{artifact_prefix}_confusion_matrix.csv",
+    )
     save_confusion_matrix_figure(
         matrix=metrics["confusion_matrix"],
         label_names=label_names,
         output_path=output_dir / f"{artifact_prefix}_confusion_matrix.png",
-        title=f"{split_name.title()} Confusion Matrix",
+        title=title,
     )
-    return metrics

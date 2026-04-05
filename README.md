@@ -1,17 +1,8 @@
 # Sleep Stage Classification with DREAMT E4 Signals
 
-This project is a clean PyTorch baseline for sleep stage classification using the DREAMT 64 Hz aligned wearable dataset. It trains a window-based 1D CNN on the eight E4 channels:
+This project is a PyTorch sleep stage classification baseline for the DREAMT 64 Hz aligned wearable dataset. It keeps the original `python -m src.main` execution path and now adds stronger diagnostics, configurable imbalance handling, better regularization controls, and a second baseline model option for temporal modeling.
 
-- `BVP`
-- `ACC_X`
-- `ACC_Y`
-- `ACC_Z`
-- `TEMP`
-- `EDA`
-- `HR`
-- `IBI`
-
-The supervised target is `Sleep_Stage`, with default training on:
+The supervised target remains `Sleep_Stage` with five classes:
 
 - `W`
 - `N1`
@@ -19,45 +10,38 @@ The supervised target is `Sleep_Stage`, with default training on:
 - `N3`
 - `R`
 
-Rows and windows dominated by `P` or `Missing` are excluded from supervised training by default.
+Excluded labels such as `P` and `Missing` are never used as supervised targets.
 
 ## Project Structure
 
 ```text
 SleepClassifier/
-├── dataset/
-│   └── data_64Hz/
-├── outputs/
-├── src/
-│   ├── data/
-│   │   ├── __init__.py
-│   │   ├── data_loading.py
-│   │   ├── preprocessing.py
-│   │   └── windowing.py
-│   ├── models/
-│   │   ├── __init__.py
-│   │   └── model.py
-│   ├── training/
-│   │   ├── __init__.py
-│   │   ├── evaluate.py
-│   │   └── train.py
-│   ├── utils/
-│   │   ├── __init__.py
-│   │   ├── checkpointing.py
-│   │   ├── metrics.py
-│   │   └── utilities.py
-│   ├── __init__.py
-│   ├── config.py
-│   └── main.py
-├── .dockerignore
-├── .gitignore
-├── compose.yaml
-├── Dockerfile
-├── README.md
-└── requirements.txt
+|-- dataset/
+|   `-- data_64Hz/
+|-- outputs/
+|-- src/
+|   |-- data/
+|   |   |-- data_loading.py
+|   |   |-- preprocessing.py
+|   |   `-- windowing.py
+|   |-- models/
+|   |   `-- model.py
+|   |-- training/
+|   |   |-- evaluate.py
+|   |   `-- train.py
+|   |-- utils/
+|   |   |-- checkpointing.py
+|   |   |-- metrics.py
+|   |   `-- utilities.py
+|   |-- config.py
+|   `-- main.py
+|-- Dockerfile
+|-- compose.yaml
+|-- requirements.txt
+`-- README.md
 ```
 
-`src/latest.pt` and `src/best.pt` are generated automatically during training.
+`src/latest.pt` and `src/best.pt` are generated during training.
 
 ## Dataset Expectations
 
@@ -74,114 +58,146 @@ Each CSV is treated as one participant/session file. The loader recursively scan
 - `IBI`
 - `Sleep_Stage`
 
-Other columns such as apnea annotations may exist, but they are ignored by the baseline pipeline.
-
-By default, local training uses:
+By default the project looks for data in:
 
 ```text
-D:\Dreamt\data_64Hz
+dataset/data_64Hz
 ```
 
-You can override this with the environment variable:
+Override that with:
 
 ```powershell
-$env:DREAMT_DATASET_DIR = "D:\Dreamt\data_64Hz"
+$env:DREAMT_DATASET_DIR = "C:\path\to\data_64Hz"
 ```
 
-For Docker, the container uses `/app/dataset/data_64Hz`, and `compose.yaml` mounts your host dataset there.
+Inside Docker, the same project-relative path resolves to `/app/dataset/data_64Hz`.
 
-## Preprocessing Behavior
+## Preprocessing
 
-The pipeline is defensive and keeps temporal order intact:
+The pipeline keeps participant files separate and applies preprocessing per file:
 
 1. `TIMESTAMP` is coerced to numeric and used for sorting only.
 2. Required columns are validated before training begins.
-3. Feature columns are converted to numeric with coercion.
-4. `Sleep_Stage` values are cleaned and validated against the known label set.
-5. Missing feature values are filled per participant.
+3. Features are converted to numeric with coercion.
+4. `Sleep_Stage` is cleaned and validated against the configured label set.
+5. Missing feature values are imputed per participant.
 
-Implemented fill strategy:
+Fill strategy:
 
-- `IBI`: forward fill, then backward fill, then `0.0` if still missing.
-- Other aligned channels: linear interpolation, then forward fill, then backward fill, then `0.0` fallback.
+- `IBI`: forward fill, backward fill, then `0.0`
+- all other aligned channels: linear interpolation, forward fill, backward fill, then `0.0`
 
-This works with 64 Hz aligned DREAMT files even though the original channels came from different native rates.
-
-## Windowing and Labels
-
-Training uses fixed windows over each participant file. Default settings are in [`src/config.py`](./src/config.py):
-
-- `window_length = 256`
-- `step = 128`
-
-Each sample is shaped as `[channels, time]`, with channels ordered as:
-
-1. `BVP`
-2. `ACC_X`
-3. `ACC_Y`
-4. `ACC_Z`
-5. `TEMP`
-6. `EDA`
-7. `HR`
-8. `IBI`
-
-Window labels are assigned by majority vote over `Sleep_Stage` inside the window.
-
-Conservative default label policy:
-
-- `P` and `Missing` are excluded from the supervised label set.
-- At least 80% of the window must contain valid supervised labels.
-- Among those valid labels, at least 80% must agree on the winning class.
-- Windows that fail those rules are dropped.
-
-The dataset also checks timestamp continuity and drops windows that span clear temporal gaps.
-
-## Train / Validation / Test Splitting
-
-Splitting is done by participant file, never by pooled rows or pooled windows. The default ratio is:
-
-- 70% train files
-- 15% validation files
-- 15% test files
-
-The split is deterministic and saved to:
-
-```text
-outputs/split_manifest.json
-```
-
-If the set of discovered files stays the same, the saved manifest is reused so repeated runs stay aligned.
-
-## Normalization
-
-Normalization statistics are computed from train participants only, then reused for validation and test without leakage.
-
-Saved artifact:
+Normalization statistics are computed from TRAIN participants only and saved to:
 
 ```text
 outputs/normalization_stats.json
 ```
 
-## Model
+## Windowing and Conservative Labels
 
-The baseline model is a multichannel 1D CNN implemented in [`src/models/model.py`](./src/models/model.py). It uses:
+Window generation is configurable in [`src/config.py`](src/config.py).
 
-- stacked `Conv1d + BatchNorm + ReLU` blocks
-- temporal pooling
-- dropout
-- a compact classifier head
+Important settings:
 
-The output layer predicts exactly five classes:
+- `window_length`
+- `step`
+- `label_purity_threshold`
+- `min_valid_fraction`
+- `drop_ambiguous_windows`
+- `require_min_valid_labels`
+- `continuity_gap_factor`
 
-- `W`
-- `N1`
-- `N2`
-- `N3`
-- `R`
+Default behavior is still conservative:
+
+- `P` and `Missing` are excluded from supervised targets
+- windows can be dropped if they contain too few valid supervised labels
+- labels are assigned by majority vote over valid labels
+- windows can be dropped if the majority label purity is below the configured threshold
+- windows spanning large timestamp discontinuities are dropped
+
+Window diagnostics are saved after generation for train, validation, and test, including:
+
+- per-class retained window counts
+- raw candidate windows per file
+- kept windows per file
+- discarded windows per file
+- discard reasons such as temporal gaps, excluded-label contamination, and insufficient purity
+
+Main artifact:
+
+```text
+outputs/dataset_summary.json
+```
+
+## Split Integrity and Leakage Guards
+
+Splitting is done by participant file only, never by pooled windows. The pipeline explicitly checks that no file appears in more than one split.
+
+The split manifest is saved to:
+
+```text
+outputs/split_manifest.json
+```
+
+That manifest includes:
+
+- train/validation/test file lists
+- file counts by split
+- window counts by split
+- window class counts by split
+- integrity checks confirming split disjointness
+
+Train-time statistics are restricted to TRAIN data only:
+
+- normalization stats: TRAIN participants only
+- class counts and class weights: TRAIN windows only
+- weighted sampling: TRAIN windows only
+
+## Model Options
+
+Model selection is controlled through `config.model.model_type`.
+
+Supported values:
+
+- `cnn_baseline`
+- `cnn_bilstm`
+
+`cnn_baseline` uses a stronger residual-style 1D CNN with dropout and pooled temporal features.
+
+`cnn_bilstm` uses the same CNN feature extractor and then runs a bidirectional LSTM over the reduced temporal sequence before classification.
+
+The input shape remains:
+
+```text
+[batch, channels, time]
+```
+
+## Imbalance Handling and Loss Options
+
+Training now supports configurable class-imbalance handling from [`src/config.py`](src/config.py):
+
+- `use_weighted_sampler`
+- `loss_name`
+- `label_smoothing`
+- `focal_gamma`
+- `focal_use_class_weights`
+- `focal_alpha`
+
+Supported losses:
+
+- `cross_entropy`
+- `weighted_cross_entropy`
+- `focal_loss`
+
+Class weights are computed from TRAIN windows only and saved to:
+
+```text
+outputs/class_weights.json
+```
 
 ## Training Behavior
 
-Training is launched with:
+Training still runs with:
 
 ```powershell
 python -m src.main
@@ -189,57 +205,74 @@ python -m src.main
 
 The training loop includes:
 
-- class weights computed from train windows only
 - `AdamW`
-- weighted cross-entropy loss
+- configurable dropout and weight decay
+- optional label smoothing for cross-entropy losses
+- optional `WeightedRandomSampler` for the training loader
 - early stopping on validation macro F1
-- latest and best checkpoints
-- validation and test metrics
-- confusion matrix plots
+- best checkpoint selection by validation macro F1
+- final test evaluation using the best checkpoint
 
-Main artifacts:
+## Evaluation Diagnostics
 
-- `src/latest.pt`
-- `src/best.pt`
-- `outputs/train.log`
+Validation and test evaluation now save richer diagnostics under `outputs/`.
+
+Saved metrics include:
+
+- loss
+- accuracy
+- balanced accuracy
+- macro precision, recall, F1
+- weighted precision, recall, F1
+- per-class precision, recall, F1
+- per-class support
+- prediction distribution per class
+- confusion matrices as JSON/CSV/PNG
+
+Key artifacts:
+
 - `outputs/training_history.json`
-- `outputs/class_weights.json`
-- `outputs/dataset_summary.json`
 - `outputs/validation/validation_latest_metrics.json`
+- `outputs/validation/validation_latest_summary.csv`
+- `outputs/validation/validation_latest_per_class_metrics.csv`
+- `outputs/validation/validation_latest_confusion_matrix.csv`
 - `outputs/validation/validation_latest_confusion_matrix.png`
 - `outputs/validation/validation_best_metrics.json`
 - `outputs/validation/validation_best_confusion_matrix.png`
+- `outputs/validation/epochs/validation_epoch_XXX_metrics.json`
+- `outputs/validation/epochs/validation_epoch_XXX_confusion_matrix.png`
 - `outputs/test/test_metrics.json`
+- `outputs/test/test_summary.csv`
+- `outputs/test/test_per_class_metrics.csv`
+- `outputs/test/test_confusion_matrix.csv`
 - `outputs/test/test_confusion_matrix.png`
 - `outputs/run_summary.json`
 
+These artifacts are intended to make class-collapse failure modes easy to inspect, especially for `N3` and `R`.
+
 ## Local Setup
 
-### 1. Create a virtual environment
+1. Create a virtual environment.
 
 ```powershell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 ```
 
-### 2. Install dependencies
+2. Install dependencies.
 
 ```powershell
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 3. Point to the dataset if needed
-
-If your CSV files already live in `D:\Dreamt\data_64Hz`, the default config is fine.
-
-If not, set:
+3. Set `DREAMT_DATASET_DIR` if your dataset is not under `dataset/data_64Hz`.
 
 ```powershell
 $env:DREAMT_DATASET_DIR = "C:\path\to\data_64Hz"
 ```
 
-### 4. Run training
+4. Run training.
 
 ```powershell
 python -m src.main
@@ -247,84 +280,65 @@ python -m src.main
 
 ## Docker Usage
 
-The Docker image is CUDA-friendly and intended for GPU training when the host has NVIDIA Container Toolkit configured.
-
-### 1. Set the host dataset path
-
 PowerShell example:
 
 ```powershell
-$env:DREAMT_HOST_DATASET_DIR = "D:/Dreamt/data_64Hz"
-```
-
-Use forward slashes in the Docker bind path on Windows to avoid quoting issues.
-
-### 2. Build and run
-
-```powershell
+$env:DREAMT_HOST_DATASET_DIR = "C:/path/to/data_64Hz"
 docker compose up --build
 ```
 
-The container will mount your host dataset into:
-
-```text
-/app/dataset/data_64Hz
-```
-
-and will run:
+The container mounts the host dataset at `/app/dataset/data_64Hz` and runs:
 
 ```text
 python -m src.main
 ```
 
-## Hyperparameter Changes
+## Common Config Knobs
 
-Edit [`src/config.py`](./src/config.py) to change:
+Edit [`src/config.py`](src/config.py) to change:
 
 - dataset path
-- window length and step
-- label filtering thresholds
-- train/validation/test ratios
-- CNN channels and kernel sizes
+- split ratios
+- window length and stride
+- label purity and valid-label thresholds
+- ambiguous-window handling
+- model type and CNN/LSTM dimensions
+- dropout
 - batch size
 - learning rate
 - weight decay
+- weighted sampling
+- loss selection
+- focal-loss gamma and alpha
 - early stopping patience
 
 ## Troubleshooting
 
 ### Dataset directory not found
 
-Set `DREAMT_DATASET_DIR` for local Python or `DREAMT_HOST_DATASET_DIR` for Docker.
+Set `DREAMT_DATASET_DIR` or place the CSV files under `dataset/data_64Hz`.
 
-### Zero windows after preprocessing
+### Zero retained windows
 
 Common causes:
 
-- windows are too short for the selected `window_length`
+- `window_length` is too large for the recordings
 - `min_valid_fraction` is too strict
-- `label_agreement_threshold` is too strict
-- timestamp gaps are causing windows to be dropped
+- `label_purity_threshold` is too strict
+- `drop_ambiguous_windows` removes too many windows
+- timestamp gaps are causing windows to be discarded
 
-### A class is missing from the train split
+### A supervised class is missing from the TRAIN split
 
-The training code raises an error if one of `W/N1/N2/N3/R` has zero train windows, because class-weighted training would be ill-defined. In that case, adjust the random seed or review dataset coverage.
+The pipeline raises an error if any of `W/N1/N2/N3/R` has zero TRAIN windows because class weights and sampling would be ill-defined.
 
-### GPU is not visible in Docker
+### Validation macro F1 is still poor
 
 Check:
 
-- Docker Desktop is using Linux containers
-- NVIDIA drivers are installed
-- NVIDIA Container Toolkit is configured
-- `docker compose` is allowed to request GPUs on your machine
+- `outputs/class_weights.json`
+- `outputs/dataset_summary.json`
+- `outputs/validation/epochs/`
+- `outputs/test/test_per_class_metrics.csv`
 
-### Running on CPU
-
-The code automatically falls back to CPU if CUDA is unavailable.
-
-## Notes
-
-- `TIMESTAMP` is never used as a direct predictive feature in the baseline.
-- Apnea event columns are intentionally excluded from the baseline model.
-- The code is written to favor correctness, explicit validation, and reproducible participant-level experiments over overly clever shortcuts.
+The first thing to inspect is usually whether predictions are collapsing into only one or two easier classes.

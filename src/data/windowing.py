@@ -6,7 +6,7 @@ import math
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -29,6 +29,38 @@ class WindowMetadata:
     label_index: int
 
 
+@dataclass(slots=True)
+class ParticipantWindowReport:
+    """Structured per-participant windowing diagnostics."""
+
+    participant_id: str
+    source_path: str
+    total_rows: int
+    candidate_windows: int
+    kept_windows: int
+    discarded_windows: int
+    ambiguous_windows_kept: int
+    too_short_for_windowing: bool
+    kept_class_counts: dict[str, int]
+    discard_reasons: dict[str, int]
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert the report into a JSON-friendly dictionary."""
+
+        return {
+            "participant_id": self.participant_id,
+            "source_path": self.source_path,
+            "total_rows": self.total_rows,
+            "candidate_windows": self.candidate_windows,
+            "kept_windows": self.kept_windows,
+            "discarded_windows": self.discarded_windows,
+            "ambiguous_windows_kept": self.ambiguous_windows_kept,
+            "too_short_for_windowing": self.too_short_for_windowing,
+            "kept_class_counts": dict(self.kept_class_counts),
+            "discard_reasons": dict(self.discard_reasons),
+        }
+
+
 class WindowedSleepDataset(Dataset[tuple[torch.Tensor, int]]):
     """PyTorch dataset that slices normalized participant arrays into windows."""
 
@@ -40,10 +72,16 @@ class WindowedSleepDataset(Dataset[tuple[torch.Tensor, int]]):
     ) -> None:
         self.feature_columns = data_config.feature_columns
         self.window_length = data_config.window_length
+        self.label_names = tuple(
+            label_name
+            for label_name, _ in sorted(label_to_index.items(), key=lambda item: item[1])
+        )
         self.samples: list[WindowMetadata] = []
         self.labels: list[int] = []
         self._signals: list[np.ndarray] = []
-        self.summary: Counter[str] = Counter()
+        self.participant_summaries: list[dict[str, Any]] = []
+
+        aggregate_reasons: Counter[str] = Counter()
 
         for participant_index, participant in enumerate(participants):
             signal_array = participant.frame.loc[:, self.feature_columns].to_numpy(
@@ -69,14 +107,38 @@ class WindowedSleepDataset(Dataset[tuple[torch.Tensor, int]]):
                 encoded_labels=encoded_labels,
                 timestamps=timestamp_array,
                 data_config=data_config,
-                num_classes=len(label_to_index),
+                label_names=self.label_names,
             )
             self.samples.extend(participant_windows)
             self.labels.extend(window.label_index for window in participant_windows)
-            self.summary.update(participant_summary)
+            self.participant_summaries.append(participant_summary.to_dict())
+            aggregate_reasons.update(participant_summary.discard_reasons)
 
-        self.summary["kept_windows"] = len(self.samples)
-        self.summary["participants"] = len(participants)
+        label_counts = self.label_counts()
+        total_candidate_windows = sum(
+            report["candidate_windows"] for report in self.participant_summaries
+        )
+        total_ambiguous_windows_kept = sum(
+            report["ambiguous_windows_kept"] for report in self.participant_summaries
+        )
+        participants_with_no_kept_windows = sum(
+            int(report["kept_windows"] == 0) for report in self.participant_summaries
+        )
+        self.summary: dict[str, Any] = {
+            "participants": len(participants),
+            "candidate_windows": int(total_candidate_windows),
+            "kept_windows": len(self.samples),
+            "discarded_windows": int(total_candidate_windows - len(self.samples)),
+            "ambiguous_windows_kept": int(total_ambiguous_windows_kept),
+            "participants_with_no_kept_windows": int(participants_with_no_kept_windows),
+            "kept_class_counts": label_counts,
+            "discard_reasons": {
+                reason: int(count)
+                for reason, count in sorted(aggregate_reasons.items())
+                if count > 0
+            },
+            "participant_summaries": self.participant_summaries,
+        }
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -89,13 +151,14 @@ class WindowedSleepDataset(Dataset[tuple[torch.Tensor, int]]):
         signal_tensor = torch.from_numpy(window.T.copy())
         return signal_tensor, metadata.label_index
 
-    def label_counts(self, label_names: Sequence[str]) -> dict[str, int]:
+    def label_counts(self, label_names: Sequence[str] | None = None) -> dict[str, int]:
         """Return the class distribution of retained windows."""
 
+        names = tuple(label_names) if label_names is not None else self.label_names
         counts = Counter(self.labels)
         return {
             label_name: int(counts.get(index, 0))
-            for index, label_name in enumerate(label_names)
+            for index, label_name in enumerate(names)
         }
 
 
@@ -133,17 +196,28 @@ def _generate_windows_for_participant(
     encoded_labels: np.ndarray,
     timestamps: np.ndarray,
     data_config: DataConfig,
-    num_classes: int,
-) -> tuple[list[WindowMetadata], Counter[str]]:
-    """Create window metadata for one participant using conservative label rules."""
+    label_names: Sequence[str],
+) -> tuple[list[WindowMetadata], ParticipantWindowReport]:
+    """Create window metadata for one participant using configurable label rules."""
 
-    total_rows = encoded_labels.shape[0]
-    summary: Counter[str] = Counter(total_rows=total_rows)
+    total_rows = int(encoded_labels.shape[0])
     windows: list[WindowMetadata] = []
+    discard_reasons: Counter[str] = Counter()
 
     if total_rows < data_config.window_length:
-        summary["too_short_participants"] += 1
-        return windows, summary
+        report = ParticipantWindowReport(
+            participant_id=participant_id,
+            source_path=str(source_path),
+            total_rows=total_rows,
+            candidate_windows=0,
+            kept_windows=0,
+            discarded_windows=0,
+            ambiguous_windows_kept=0,
+            too_short_for_windowing=True,
+            kept_class_counts=_empty_label_counts(label_names),
+            discard_reasons={"too_short_for_windowing": 1},
+        )
+        return windows, report
 
     valid_prefix = np.concatenate(
         [np.array([0], dtype=np.int64), np.cumsum(encoded_labels >= 0, dtype=np.int64)]
@@ -155,7 +229,7 @@ def _generate_windows_for_participant(
                 np.cumsum(encoded_labels == class_index, dtype=np.int64),
             ]
         )
-        for class_index in range(num_classes)
+        for class_index in range(len(label_names))
     ]
     gap_prefix = _build_gap_prefix(
         timestamps=timestamps,
@@ -163,18 +237,24 @@ def _generate_windows_for_participant(
     )
 
     min_valid_count = math.ceil(data_config.min_valid_fraction * data_config.window_length)
+    candidate_windows = 0
+    ambiguous_windows_kept = 0
 
     for start_index in range(0, total_rows - data_config.window_length + 1, data_config.step):
-        summary["candidate_windows"] += 1
+        candidate_windows += 1
         end_index = start_index + data_config.window_length
 
         if _window_crosses_gap(gap_prefix, start_index, end_index):
-            summary["dropped_temporal_gap"] += 1
+            discard_reasons["temporal_gap"] += 1
             continue
 
         valid_count = int(valid_prefix[end_index] - valid_prefix[start_index])
-        if valid_count < min_valid_count:
-            summary["dropped_low_valid_fraction"] += 1
+        if valid_count == 0:
+            discard_reasons["no_valid_supervised_labels"] += 1
+            continue
+
+        if data_config.require_min_valid_labels and valid_count < min_valid_count:
+            discard_reasons["excluded_label_contamination"] += 1
             continue
 
         class_counts = np.array(
@@ -186,14 +266,13 @@ def _generate_windows_for_participant(
         )
         majority_class = int(class_counts.argmax())
         majority_count = int(class_counts[majority_class])
+        purity = majority_count / valid_count
 
-        if valid_count == 0:
-            summary["dropped_no_valid_labels"] += 1
+        if purity < data_config.label_purity_threshold and data_config.drop_ambiguous_windows:
+            discard_reasons["insufficient_purity"] += 1
             continue
-
-        if (majority_count / valid_count) < data_config.label_agreement_threshold:
-            summary["dropped_low_agreement"] += 1
-            continue
+        if purity < data_config.label_purity_threshold:
+            ambiguous_windows_kept += 1
 
         windows.append(
             WindowMetadata(
@@ -206,7 +285,27 @@ def _generate_windows_for_participant(
             )
         )
 
-    return windows, summary
+    kept_label_counts = Counter(window.label_index for window in windows)
+    report = ParticipantWindowReport(
+        participant_id=participant_id,
+        source_path=str(source_path),
+        total_rows=total_rows,
+        candidate_windows=candidate_windows,
+        kept_windows=len(windows),
+        discarded_windows=candidate_windows - len(windows),
+        ambiguous_windows_kept=ambiguous_windows_kept,
+        too_short_for_windowing=False,
+        kept_class_counts={
+            label_name: int(kept_label_counts.get(index, 0))
+            for index, label_name in enumerate(label_names)
+        },
+        discard_reasons={
+            reason: int(count)
+            for reason, count in sorted(discard_reasons.items())
+            if count > 0
+        },
+    )
+    return windows, report
 
 
 def _build_gap_prefix(
@@ -237,3 +336,9 @@ def _window_crosses_gap(gap_prefix: np.ndarray, start_index: int, end_index: int
     if end_index - start_index < 2:
         return False
     return bool(gap_prefix[end_index - 1] - gap_prefix[start_index])
+
+
+def _empty_label_counts(label_names: Sequence[str]) -> dict[str, int]:
+    """Create a zero-filled label-count dictionary."""
+
+    return {label_name: 0 for label_name in label_names}

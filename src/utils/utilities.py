@@ -1,12 +1,13 @@
-"""Shared utility functions for reproducibility, logging, and JSON I/O."""
+"""Shared utility functions for reproducibility, logging, and structured I/O."""
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import random
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -37,6 +38,21 @@ def save_json(payload: Any, path: Path) -> None:
     ensure_directory(path.parent)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True, default=_json_default)
+
+
+def save_csv_rows(
+    rows: Sequence[Mapping[str, Any]],
+    path: Path,
+    fieldnames: Sequence[str],
+) -> None:
+    """Write a list of dictionaries to CSV using a fixed column order."""
+
+    ensure_directory(path.parent)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(fieldnames))
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
 
 
 def load_json(path: Path) -> Any:
