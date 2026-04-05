@@ -1,0 +1,19 @@
+services:
+  trainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m src.main
+    working_dir: /app
+    environment:
+      PYTHONUNBUFFERED: "1"
+      DREAMT_DATASET_DIR: /app/dataset/data_64Hz
+    volumes:
+      - type: bind
+        source: .
+        target: /app
+      - type: bind
+        source: ${DREAMT_HOST_DATASET_DIR:-./dataset/data_64Hz}
+        target: /app/dataset/data_64Hz
+        read_only: true
+    gpus: all
