@@ -28,7 +28,7 @@ def _default_dataset_dir() -> Path:
     env_value = os.getenv("DREAMT_DATASET_DIR")
     if env_value:
         return Path(env_value)
-    return PROJECT_ROOT / "dataset" / "data_64Hz"
+    return Path(r"D:\Dreamt\data_64Hz")
 
 
 @dataclass(slots=True, frozen=True)
