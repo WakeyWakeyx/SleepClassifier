@@ -39,11 +39,17 @@ def evaluate_model(
     all_predictions: list[int] = []
 
     progress = tqdm(dataloader, desc=f"Evaluating {split_name}", leave=False)
-    for inputs, targets in progress:
-        inputs = inputs.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
+    for batch in progress:
+        inputs = batch["inputs"].to(device, non_blocking=True)
+        targets = batch["target"].to(device, non_blocking=True)
+        target_start_indices = batch["target_start_idx"].to(device, non_blocking=True)
+        target_end_indices = batch["target_end_idx"].to(device, non_blocking=True)
 
-        logits = model(inputs)
+        logits = model(
+            inputs,
+            target_start_indices=target_start_indices,
+            target_end_indices=target_end_indices,
+        )
         loss = criterion(logits, targets)
 
         batch_size = targets.size(0)

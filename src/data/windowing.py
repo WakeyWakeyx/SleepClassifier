@@ -6,7 +6,7 @@ import math
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, TypedDict
 
 import numpy as np
 import torch
@@ -17,15 +17,26 @@ from src.config import DataConfig
 from .data_loading import ParticipantData
 
 
+class WindowSample(TypedDict):
+    """One supervised sample made from a contiguous multichannel time sequence."""
+
+    inputs: torch.Tensor
+    target: int
+    target_start_idx: int
+    target_end_idx: int
+
+
 @dataclass(slots=True, frozen=True)
 class WindowMetadata:
-    """Metadata describing a single retained window."""
+    """Metadata describing one retained supervised target segment and its input span."""
 
     participant_index: int
     participant_id: str
     source_path: str
-    start_index: int
-    end_index: int
+    input_start_index: int
+    input_end_index: int
+    target_start_index: int
+    target_end_index: int
     label_index: int
 
 
@@ -61,8 +72,8 @@ class ParticipantWindowReport:
         }
 
 
-class WindowedSleepDataset(Dataset[tuple[torch.Tensor, int]]):
-    """PyTorch dataset that slices normalized participant arrays into windows."""
+class WindowedSleepDataset(Dataset[WindowSample]):
+    """Slice participant arrays into contiguous sequence windows for one target label."""
 
     def __init__(
         self,
@@ -71,7 +82,10 @@ class WindowedSleepDataset(Dataset[tuple[torch.Tensor, int]]):
         label_to_index: Mapping[str, int],
     ) -> None:
         self.feature_columns = data_config.feature_columns
-        self.window_length = data_config.window_length
+        self.target_window_length = data_config.target_window_length
+        self.left_context = data_config.effective_left_context
+        self.right_context = data_config.effective_right_context
+        self.input_window_length = data_config.input_window_length
         self.label_names = tuple(
             label_name
             for label_name, _ in sorted(label_to_index.items(), key=lambda item: item[1])
@@ -137,22 +151,31 @@ class WindowedSleepDataset(Dataset[tuple[torch.Tensor, int]]):
                 for reason, count in sorted(aggregate_reasons.items())
                 if count > 0
             },
+            "sequence_definition": _build_sequence_definition(data_config),
             "participant_summaries": self.participant_summaries,
         }
 
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
+    def __getitem__(self, index: int) -> WindowSample:
         metadata = self.samples[index]
         window = self._signals[metadata.participant_index][
-            metadata.start_index : metadata.end_index
+            metadata.input_start_index : metadata.input_end_index
         ]
         signal_tensor = torch.from_numpy(window.T.copy())
-        return signal_tensor, metadata.label_index
+        target_start_idx = metadata.target_start_index - metadata.input_start_index
+        target_end_idx = metadata.target_end_index - metadata.input_start_index
+
+        return {
+            "inputs": signal_tensor,
+            "target": metadata.label_index,
+            "target_start_idx": target_start_idx,
+            "target_end_idx": target_end_idx,
+        }
 
     def label_counts(self, label_names: Sequence[str] | None = None) -> dict[str, int]:
-        """Return the class distribution of retained windows."""
+        """Return the class distribution of retained target windows."""
 
         names = tuple(label_names) if label_names is not None else self.label_names
         counts = Counter(self.labels)
@@ -198,13 +221,21 @@ def _generate_windows_for_participant(
     data_config: DataConfig,
     label_names: Sequence[str],
 ) -> tuple[list[WindowMetadata], ParticipantWindowReport]:
-    """Create window metadata for one participant using configurable label rules."""
+    """Create sequence windows and target labels for one participant.
+
+    Each retained sample is one contiguous input span:
+    left context + target segment + right context.
+
+    The supervised label is determined from the target segment only. Context rows
+    can help the model disambiguate transitions, but they never influence label
+    assignment or purity checks.
+    """
 
     total_rows = int(encoded_labels.shape[0])
     windows: list[WindowMetadata] = []
     discard_reasons: Counter[str] = Counter()
 
-    if total_rows < data_config.window_length:
+    if total_rows < data_config.input_window_length:
         report = ParticipantWindowReport(
             participant_id=participant_id,
             source_path=str(source_path),
@@ -236,19 +267,23 @@ def _generate_windows_for_participant(
         continuity_gap_factor=data_config.continuity_gap_factor,
     )
 
-    min_valid_count = math.ceil(data_config.min_valid_fraction * data_config.window_length)
+    min_valid_count = math.ceil(
+        data_config.min_valid_fraction * data_config.target_window_length
+    )
     candidate_windows = 0
     ambiguous_windows_kept = 0
 
-    for start_index in range(0, total_rows - data_config.window_length + 1, data_config.step):
+    for target_start_index in _candidate_target_start_indices(total_rows, data_config):
         candidate_windows += 1
-        end_index = start_index + data_config.window_length
+        input_start_index = target_start_index - data_config.effective_left_context
+        target_end_index = target_start_index + data_config.target_window_length
+        input_end_index = target_end_index + data_config.effective_right_context
 
-        if _window_crosses_gap(gap_prefix, start_index, end_index):
+        if _window_crosses_gap(gap_prefix, input_start_index, input_end_index):
             discard_reasons["temporal_gap"] += 1
             continue
 
-        valid_count = int(valid_prefix[end_index] - valid_prefix[start_index])
+        valid_count = int(valid_prefix[target_end_index] - valid_prefix[target_start_index])
         if valid_count == 0:
             discard_reasons["no_valid_supervised_labels"] += 1
             continue
@@ -259,7 +294,7 @@ def _generate_windows_for_participant(
 
         class_counts = np.array(
             [
-                class_prefix[end_index] - class_prefix[start_index]
+                class_prefix[target_end_index] - class_prefix[target_start_index]
                 for class_prefix in class_prefixes
             ],
             dtype=np.int64,
@@ -279,8 +314,10 @@ def _generate_windows_for_participant(
                 participant_index=participant_index,
                 participant_id=participant_id,
                 source_path=str(source_path),
-                start_index=start_index,
-                end_index=end_index,
+                input_start_index=input_start_index,
+                input_end_index=input_end_index,
+                target_start_index=target_start_index,
+                target_end_index=target_end_index,
                 label_index=majority_class,
             )
         )
@@ -308,6 +345,21 @@ def _generate_windows_for_participant(
     return windows, report
 
 
+def _candidate_target_start_indices(
+    total_rows: int,
+    data_config: DataConfig,
+) -> range:
+    """Yield target starts whose full input spans fit within participant boundaries."""
+
+    first_target_start = data_config.effective_left_context
+    last_target_start = (
+        total_rows
+        - data_config.target_window_length
+        - data_config.effective_right_context
+    )
+    return range(first_target_start, last_target_start + 1, data_config.step)
+
+
 def _build_gap_prefix(
     timestamps: np.ndarray,
     continuity_gap_factor: float,
@@ -331,11 +383,26 @@ def _build_gap_prefix(
 
 
 def _window_crosses_gap(gap_prefix: np.ndarray, start_index: int, end_index: int) -> bool:
-    """Return True when a window spans a detected timestamp discontinuity."""
+    """Return True when a contiguous input span crosses a detected timestamp gap."""
 
     if end_index - start_index < 2:
         return False
     return bool(gap_prefix[end_index - 1] - gap_prefix[start_index])
+
+
+def _build_sequence_definition(data_config: DataConfig) -> dict[str, int | bool]:
+    """Serialize how each supervised sample is constructed."""
+
+    return {
+        "use_context_windows": data_config.use_context_windows,
+        "target_window_length": data_config.target_window_length,
+        "configured_left_context": data_config.left_context,
+        "configured_right_context": data_config.right_context,
+        "left_context": data_config.effective_left_context,
+        "right_context": data_config.effective_right_context,
+        "total_input_length": data_config.input_window_length,
+        "step": data_config.step,
+    }
 
 
 def _empty_label_counts(label_names: Sequence[str]) -> dict[str, int]:

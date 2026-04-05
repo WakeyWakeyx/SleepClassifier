@@ -21,6 +21,23 @@ FEATURE_COLUMNS: tuple[str, ...] = (
 LABEL_NAMES: tuple[str, ...] = ("W", "N1", "N2", "N3", "R")
 EXCLUDED_LABELS: tuple[str, ...] = ("P", "Missing")
 
+# Core sequence-window defaults. Each supervised example is one contiguous
+# multichannel time series, and the label is assigned from the target segment only.
+TARGET_WINDOW_LENGTH = 256
+STEP = 128
+USE_CONTEXT_WINDOWS = True
+LEFT_CONTEXT = 256
+RIGHT_CONTEXT = 256
+LABEL_PURITY_THRESHOLD = 0.80
+
+# Frequently tuned training/model defaults exposed as clear top-level knobs.
+MODEL_NAME = "cnn_bilstm"
+DROPOUT = 0.40
+LOSS_NAME = "cross_entropy"
+LABEL_SMOOTHING = 0.05
+USE_WEIGHTED_SAMPLER = True
+CLASS_WEIGHTING = "inverse_frequency"
+
 
 def _default_dataset_dir() -> Path:
     """Resolve the dataset directory with an environment override."""
@@ -33,7 +50,7 @@ def _default_dataset_dir() -> Path:
 
 @dataclass(slots=True, frozen=True)
 class DataConfig:
-    """Configuration for dataset discovery, cleaning, splitting, and windowing."""
+    """Configuration for dataset discovery, cleaning, splitting, and sequence windowing."""
 
     dataset_dir: Path = field(default_factory=_default_dataset_dir)
     timestamp_column: str = "TIMESTAMP"
@@ -41,9 +58,12 @@ class DataConfig:
     feature_columns: tuple[str, ...] = FEATURE_COLUMNS
     label_names: tuple[str, ...] = LABEL_NAMES
     excluded_labels: tuple[str, ...] = EXCLUDED_LABELS
-    window_length: int = 256
-    step: int = 128
-    label_purity_threshold: float = 0.80
+    target_window_length: int = TARGET_WINDOW_LENGTH
+    step: int = STEP
+    use_context_windows: bool = USE_CONTEXT_WINDOWS
+    left_context: int = LEFT_CONTEXT
+    right_context: int = RIGHT_CONTEXT
+    label_purity_threshold: float = LABEL_PURITY_THRESHOLD
     min_valid_fraction: float = 0.80
     drop_ambiguous_windows: bool = True
     require_min_valid_labels: bool = True
@@ -51,6 +71,46 @@ class DataConfig:
     train_ratio: float = 0.70
     val_ratio: float = 0.15
     test_ratio: float = 0.15
+
+    @property
+    def effective_left_context(self) -> int:
+        """Context actually prepended to the target segment for model input."""
+
+        return self.left_context if self.use_context_windows else 0
+
+    @property
+    def effective_right_context(self) -> int:
+        """Context actually appended to the target segment for model input."""
+
+        return self.right_context if self.use_context_windows else 0
+
+    @property
+    def input_window_length(self) -> int:
+        """Total number of timesteps consumed by the model for one sample."""
+
+        return (
+            self.effective_left_context
+            + self.target_window_length
+            + self.effective_right_context
+        )
+
+    @property
+    def target_start_offset(self) -> int:
+        """Start index of the supervised target segment within the model input."""
+
+        return self.effective_left_context
+
+    @property
+    def target_end_offset(self) -> int:
+        """Exclusive end index of the supervised target segment within the input."""
+
+        return self.target_start_offset + self.target_window_length
+
+    @property
+    def window_length(self) -> int:
+        """Backward-compatible alias for the supervised target segment length."""
+
+        return self.target_window_length
 
     @property
     def label_agreement_threshold(self) -> float:
@@ -61,18 +121,24 @@ class DataConfig:
 
 @dataclass(slots=True, frozen=True)
 class ModelConfig:
-    """Configuration for the configurable CNN-based baselines."""
+    """Configuration for the configurable CNN-based sequence models."""
 
-    model_type: str = "cnn_bilstm"
+    model_name: str = MODEL_NAME
     input_channels: int = len(FEATURE_COLUMNS)
     num_classes: int = len(LABEL_NAMES)
     conv_channels: tuple[int, ...] = (64, 128, 192)
     kernel_sizes: tuple[int, ...] = (7, 5, 5)
-    dropout: float = 0.40
+    dropout: float = DROPOUT
     classifier_hidden_dim: int = 128
     lstm_hidden_size: int = 128
     lstm_num_layers: int = 1
     lstm_dropout: float = 0.20
+
+    @property
+    def model_type(self) -> str:
+        """Backward-compatible alias for the selected model architecture."""
+
+        return self.model_name
 
 
 @dataclass(slots=True, frozen=True)
@@ -88,9 +154,10 @@ class TrainingConfig:
     patience: int = 8
     min_delta: float = 1e-4
     gradient_clip_norm: float = 1.0
-    use_weighted_sampler: bool = True
-    loss_name: str = "cross_entropy"
-    label_smoothing: float = 0.05
+    use_weighted_sampler: bool = USE_WEIGHTED_SAMPLER
+    loss_name: str = LOSS_NAME
+    label_smoothing: float = LABEL_SMOOTHING
+    class_weighting_mode: str = CLASS_WEIGHTING
     focal_gamma: float = 2.0
     focal_use_class_weights: bool = True
     focal_alpha: tuple[float, ...] | None = None
@@ -147,8 +214,8 @@ def build_config() -> ProjectConfig:
         raise ValueError(
             "Model num_classes must match the number of configured label names."
         )
-    if config.model.model_type not in {"cnn_baseline", "cnn_bilstm"}:
-        raise ValueError("model_type must be 'cnn_baseline' or 'cnn_bilstm'.")
+    if config.model.model_name not in {"cnn_baseline", "cnn_bilstm"}:
+        raise ValueError("model_name must be 'cnn_baseline' or 'cnn_bilstm'.")
     if len(config.model.conv_channels) != len(config.model.kernel_sizes):
         raise ValueError("conv_channels and kernel_sizes must have the same length.")
     if not config.model.conv_channels:
@@ -166,8 +233,12 @@ def build_config() -> ProjectConfig:
         config.data.train_ratio + config.data.val_ratio + config.data.test_ratio - 1.0
     ) > 1e-6:
         raise ValueError("Train/validation/test split ratios must sum to 1.0.")
-    if config.data.window_length <= 0 or config.data.step <= 0:
-        raise ValueError("window_length and step must be positive integers.")
+    if config.data.target_window_length <= 0 or config.data.step <= 0:
+        raise ValueError("target_window_length and step must be positive integers.")
+    if config.data.left_context < 0 or config.data.right_context < 0:
+        raise ValueError("left_context and right_context must be non-negative integers.")
+    if config.data.input_window_length <= 0:
+        raise ValueError("input_window_length must be positive.")
     if not 0.0 < config.data.label_purity_threshold <= 1.0:
         raise ValueError("label_purity_threshold must be in the interval (0, 1].")
     if not 0.0 < config.data.min_valid_fraction <= 1.0:
@@ -183,6 +254,8 @@ def build_config() -> ProjectConfig:
         raise ValueError(
             "loss_name must be one of: cross_entropy, weighted_cross_entropy, focal_loss."
         )
+    if config.training.class_weighting_mode not in {"none", "inverse_frequency"}:
+        raise ValueError("class_weighting_mode must be 'none' or 'inverse_frequency'.")
     if not 0.0 <= config.training.label_smoothing < 1.0:
         raise ValueError("label_smoothing must be in the interval [0, 1).")
     if config.training.focal_gamma < 0.0:
