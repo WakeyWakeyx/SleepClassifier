@@ -14,7 +14,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader, Sampler, WeightedRandomSampler
 from tqdm.auto import tqdm
 
-from src.config import ProjectConfig
+from src.config import DataConfig, ProjectConfig
 from src.data.data_loading import (
     ParticipantData,
     build_split_manifest_payload,
@@ -94,11 +94,13 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
     logger.info("Using device: %s", device)
     logger.info("Dataset directory: %s", config.data.dataset_dir)
     logger.info(
-        "Configured model=%s | loss=%s | weighted_sampler=%s",
-        config.model.model_type,
+        "Configured model=%s | loss=%s | weighted_sampler=%s | class_weighting=%s",
+        config.model.model_name,
         config.training.loss_name,
         config.training.use_weighted_sampler,
+        config.training.class_weighting_mode,
     )
+    _log_sequence_configuration(logger, config.data)
 
     participant_files = discover_participant_files(config.data.dataset_dir)
     participant_split = split_participant_files(
@@ -175,15 +177,7 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
     _validate_dataset_sizes(train_dataset, val_dataset, test_dataset)
 
     dataset_summary = {
-        "windowing_config": {
-            "window_length": config.data.window_length,
-            "step": config.data.step,
-            "label_purity_threshold": config.data.label_purity_threshold,
-            "min_valid_fraction": config.data.min_valid_fraction,
-            "drop_ambiguous_windows": config.data.drop_ambiguous_windows,
-            "require_min_valid_labels": config.data.require_min_valid_labels,
-            "continuity_gap_factor": config.data.continuity_gap_factor,
-        },
+        "windowing_config": _build_windowing_config_summary(config.data),
         "train": _build_split_dataset_summary(
             dataset=train_dataset,
             split_files=participant_split.train_files,
@@ -247,10 +241,12 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
         labels=train_dataset.labels,
         num_classes=config.model.num_classes,
         label_names=config.data.label_names,
+        class_weighting_mode=config.training.class_weighting_mode,
         output_path=config.paths.class_weights_path,
     )
     logger.info(
-        "Class weights computed from TRAIN windows only | %s",
+        "Class weights computed from TRAIN windows only | mode=%s | %s",
+        config.training.class_weighting_mode,
         _format_named_values(
             {
                 label_name: float(class_weights[index].item())
@@ -490,6 +486,7 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
     summary = {
         "device": str(device),
         "dataset_dir": str(config.data.dataset_dir),
+        "sequence_definition": _build_windowing_config_summary(config.data),
         "best_epoch": best_epoch,
         "best_val_macro_f1": best_val_macro_f1,
         "train_class_counts": {
@@ -564,9 +561,10 @@ def _compute_class_weights(
     labels: Sequence[int],
     num_classes: int,
     label_names: Sequence[str],
+    class_weighting_mode: str,
     output_path: Path,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute inverse-frequency class weights from train windows only."""
+    """Compute train-only class weights according to the configured weighting mode."""
 
     if not labels:
         raise ValueError("Train dataset produced no labels for class weight computation.")
@@ -583,13 +581,17 @@ def _compute_class_weights(
             + ", ".join(zero_classes)
         )
 
-    total = counts.sum().float()
-    weights = total / (counts.float() * float(num_classes))
-    weights = weights / weights.mean()
+    if class_weighting_mode == "inverse_frequency":
+        total = counts.sum().float()
+        weights = total / (counts.float() * float(num_classes))
+        weights = weights / weights.mean()
+    else:
+        weights = torch.ones(num_classes, dtype=torch.float32)
 
     save_json(
         {
-            "computed_from": "train_windows_only",
+            "computed_from": "train_target_windows_only",
+            "class_weighting_mode": class_weighting_mode,
             "counts": {
                 label_names[index]: int(counts[index].item())
                 for index in range(num_classes)
@@ -609,7 +611,7 @@ def _build_weighted_sampler(
     class_weights: torch.Tensor,
     seed: int,
 ) -> WeightedRandomSampler:
-    """Create a train-only weighted sampler using inverse-frequency class weights."""
+    """Create a train-only weighted sampler using train-window class weights."""
 
     label_tensor = torch.tensor(labels, dtype=torch.long)
     sample_weights = class_weights[label_tensor].double()
@@ -645,7 +647,7 @@ def _build_training_criterion(
             (
                 "weighted_cross_entropy("
                 f"label_smoothing={config.training.label_smoothing:.3f}, "
-                "class_weights=train_window_inverse_frequency)"
+                f"class_weights=train_window_{config.training.class_weighting_mode})"
             ),
         )
 
@@ -656,7 +658,7 @@ def _build_training_criterion(
         focal_alpha_description = "config_focal_alpha"
     elif config.training.focal_use_class_weights:
         focal_alpha = class_weights.to(device)
-        focal_alpha_description = "train_window_class_weights"
+        focal_alpha_description = f"train_window_{config.training.class_weighting_mode}"
 
     return (
         FocalLoss(
@@ -689,12 +691,18 @@ def _train_one_epoch(
     total_examples = 0
 
     progress = tqdm(dataloader, desc=f"Epoch {epoch}/{max_epochs}", leave=False)
-    for inputs, targets in progress:
-        inputs = inputs.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
+    for batch in progress:
+        inputs = batch["inputs"].to(device, non_blocking=True)
+        targets = batch["target"].to(device, non_blocking=True)
+        target_start_indices = batch["target_start_idx"].to(device, non_blocking=True)
+        target_end_indices = batch["target_end_idx"].to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        logits = model(inputs)
+        logits = model(
+            inputs,
+            target_start_indices=target_start_indices,
+            target_end_indices=target_end_indices,
+        )
         loss = criterion(logits, targets)
         loss.backward()
 
@@ -736,6 +744,20 @@ def _log_window_summary(
 ) -> None:
     """Log concise split-level window generation diagnostics."""
 
+    sequence_definition = dataset.summary["sequence_definition"]
+    if sequence_definition["use_context_windows"]:
+        logger.info(
+            (
+                "%s sequence definition | target_length=%d left_context=%d "
+                "right_context=%d total_input_length=%d"
+            ),
+            split_name,
+            sequence_definition["target_window_length"],
+            sequence_definition["left_context"],
+            sequence_definition["right_context"],
+            sequence_definition["total_input_length"],
+        )
+
     logger.info(
         (
             "%s windows | candidates=%d kept=%d discarded=%d "
@@ -759,6 +781,46 @@ def _log_window_summary(
             split_name,
             _format_named_values(dataset.summary["discard_reasons"], digits=0),
         )
+
+
+def _log_sequence_configuration(
+    logger: logging.Logger,
+    data_config: DataConfig,
+) -> None:
+    """Log how each supervised sequence sample is constructed."""
+
+    logger.info(
+        (
+            "Sequence windowing | target_length=%d | left_context=%d | "
+            "right_context=%d | total_input_length=%d | step=%d | use_context_windows=%s"
+        ),
+        data_config.target_window_length,
+        data_config.effective_left_context,
+        data_config.effective_right_context,
+        data_config.input_window_length,
+        data_config.step,
+        data_config.use_context_windows,
+    )
+
+
+def _build_windowing_config_summary(data_config: DataConfig) -> dict[str, int | float | bool]:
+    """Serialize the sequence windowing configuration saved with artifacts."""
+
+    return {
+        "target_window_length": data_config.target_window_length,
+        "step": data_config.step,
+        "use_context_windows": data_config.use_context_windows,
+        "configured_left_context": data_config.left_context,
+        "configured_right_context": data_config.right_context,
+        "left_context": data_config.effective_left_context,
+        "right_context": data_config.effective_right_context,
+        "total_input_length": data_config.input_window_length,
+        "label_purity_threshold": data_config.label_purity_threshold,
+        "min_valid_fraction": data_config.min_valid_fraction,
+        "drop_ambiguous_windows": data_config.drop_ambiguous_windows,
+        "require_min_valid_labels": data_config.require_min_valid_labels,
+        "continuity_gap_factor": data_config.continuity_gap_factor,
+    }
 
 
 def _format_per_class_metric(

@@ -103,6 +103,7 @@ class TemporalConvEncoder(nn.Module):
 
         self.pool = nn.MaxPool1d(kernel_size=2, stride=2)
         self.output_channels = current_channels
+        self.num_pool_layers = max(len(self.blocks) - 1, 0)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         outputs = inputs
@@ -111,6 +112,32 @@ class TemporalConvEncoder(nn.Module):
             if block_index < len(self.blocks) - 1:
                 outputs = self.pool(outputs)
         return outputs
+
+    def downsample_target_bounds(
+        self,
+        target_start_indices: torch.Tensor | None,
+        target_end_indices: torch.Tensor | None,
+        encoded_length: int,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Project input-space target bounds onto the encoder's reduced time axis."""
+
+        if target_start_indices is None or target_end_indices is None:
+            return None, None
+        if encoded_length <= 0:
+            raise ValueError("encoded_length must be positive.")
+
+        reduced_starts = target_start_indices.long()
+        reduced_ends = target_end_indices.long()
+
+        for _ in range(self.num_pool_layers):
+            reduced_starts = torch.div(reduced_starts, 2, rounding_mode="floor")
+            reduced_ends = torch.div(reduced_ends + 1, 2, rounding_mode="floor")
+
+        reduced_starts = reduced_starts.clamp(min=0, max=encoded_length - 1)
+        reduced_ends = reduced_ends.clamp(min=1, max=encoded_length)
+        reduced_ends = torch.maximum(reduced_ends, reduced_starts + 1)
+        reduced_ends = reduced_ends.clamp(max=encoded_length)
+        return reduced_starts, reduced_ends
 
 
 class MLPClassifier(nn.Module):
@@ -136,7 +163,7 @@ class MLPClassifier(nn.Module):
 
 
 class SleepStageCNNBaseline(nn.Module):
-    """Residual-style CNN baseline for multichannel time-series windows."""
+    """Residual-style CNN baseline for multichannel time-series sequence windows."""
 
     def __init__(
         self,
@@ -154,8 +181,6 @@ class SleepStageCNNBaseline(nn.Module):
             kernel_sizes=kernel_sizes,
             dropout=dropout,
         )
-        self.avg_pool = nn.AdaptiveAvgPool1d(1)
-        self.max_pool = nn.AdaptiveMaxPool1d(1)
         self.classifier = MLPClassifier(
             input_dim=self.encoder.output_channels * 2,
             hidden_dim=classifier_hidden_dim,
@@ -163,11 +188,26 @@ class SleepStageCNNBaseline(nn.Module):
             dropout=dropout,
         )
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        target_start_indices: torch.Tensor | None = None,
+        target_end_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # inputs: [batch, channels, time]
         features = self.encoder(inputs)
-        avg_features = self.avg_pool(features).squeeze(-1)
-        max_features = self.max_pool(features).squeeze(-1)
-        pooled_features = torch.cat([avg_features, max_features], dim=1)
+        # sequence_features: [batch, reduced_time, feature_dim]
+        sequence_features = features.transpose(1, 2).contiguous()
+        reduced_starts, reduced_ends = self.encoder.downsample_target_bounds(
+            target_start_indices=target_start_indices,
+            target_end_indices=target_end_indices,
+            encoded_length=sequence_features.size(1),
+        )
+        pooled_features = _pool_sequence_region(
+            sequence_features=sequence_features,
+            target_start_indices=reduced_starts,
+            target_end_indices=reduced_ends,
+        )
         return self.classifier(pooled_features)
 
 
@@ -209,7 +249,12 @@ class SleepStageCNNBiLSTM(nn.Module):
             dropout=dropout,
         )
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        target_start_indices: torch.Tensor | None = None,
+        target_end_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         # inputs: [batch, channels, time]
         features = self.encoder(inputs)
         # sequence_features: [batch, reduced_time, feature_dim]
@@ -217,9 +262,16 @@ class SleepStageCNNBiLSTM(nn.Module):
         sequence_features = self.sequence_dropout(sequence_features)
 
         lstm_outputs, _ = self.sequence_model(sequence_features)
-        mean_features = lstm_outputs.mean(dim=1)
-        max_features = lstm_outputs.amax(dim=1)
-        pooled_features = torch.cat([mean_features, max_features], dim=1)
+        reduced_starts, reduced_ends = self.encoder.downsample_target_bounds(
+            target_start_indices=target_start_indices,
+            target_end_indices=target_end_indices,
+            encoded_length=lstm_outputs.size(1),
+        )
+        pooled_features = _pool_sequence_region(
+            sequence_features=lstm_outputs,
+            target_start_indices=reduced_starts,
+            target_end_indices=reduced_ends,
+        )
         return self.classifier(pooled_features)
 
 
@@ -235,16 +287,57 @@ def build_model(config: ModelConfig) -> nn.Module:
         "classifier_hidden_dim": config.classifier_hidden_dim,
     }
 
-    if config.model_type == "cnn_baseline":
+    if config.model_name == "cnn_baseline":
         return SleepStageCNNBaseline(**common_kwargs)
-    if config.model_type == "cnn_bilstm":
+    if config.model_name == "cnn_bilstm":
         return SleepStageCNNBiLSTM(
             **common_kwargs,
             lstm_hidden_size=config.lstm_hidden_size,
             lstm_num_layers=config.lstm_num_layers,
             lstm_dropout=config.lstm_dropout,
         )
-    raise ValueError(f"Unsupported model_type: {config.model_type}")
+    raise ValueError(f"Unsupported model_name: {config.model_name}")
+
+
+def _pool_sequence_region(
+    sequence_features: torch.Tensor,
+    target_start_indices: torch.Tensor | None,
+    target_end_indices: torch.Tensor | None,
+) -> torch.Tensor:
+    """Pool only the target region so context informs features without owning the label."""
+
+    batch_size, sequence_length, _ = sequence_features.shape
+    if target_start_indices is None or target_end_indices is None:
+        target_start_indices = torch.zeros(
+            batch_size,
+            dtype=torch.long,
+            device=sequence_features.device,
+        )
+        target_end_indices = torch.full(
+            (batch_size,),
+            fill_value=sequence_length,
+            dtype=torch.long,
+            device=sequence_features.device,
+        )
+    else:
+        target_start_indices = target_start_indices.to(sequence_features.device).long()
+        target_end_indices = target_end_indices.to(sequence_features.device).long()
+
+    time_indices = torch.arange(sequence_length, device=sequence_features.device).unsqueeze(0)
+    target_mask = (time_indices >= target_start_indices.unsqueeze(1)) & (
+        time_indices < target_end_indices.unsqueeze(1)
+    )
+    target_mask = target_mask.unsqueeze(-1)
+
+    masked_sum = sequence_features.masked_fill(~target_mask, 0.0).sum(dim=1)
+    target_lengths = target_mask.sum(dim=1).clamp_min(1).to(sequence_features.dtype)
+    mean_features = masked_sum / target_lengths
+
+    mask_fill_value = torch.finfo(sequence_features.dtype).min
+    masked_max = sequence_features.masked_fill(~target_mask, mask_fill_value)
+    max_features = masked_max.amax(dim=1)
+
+    return torch.cat([mean_features, max_features], dim=1)
 
 
 SleepStageCNN = SleepStageCNNBaseline
