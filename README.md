@@ -1,14 +1,14 @@
 # Sleep Stage Classification with DREAMT E4 Signals
 
-This project is a PyTorch sleep stage classifier for the DREAMT 64 Hz aligned wearable dataset. It keeps the existing `python -m src.main` entry point, participant-level split integrity, train-only normalization, diagnostics, metrics, and checkpointing, while making the supervised pipeline more explicitly sequence-aware.
+This project is a PyTorch sleep stage classifier for the DREAMT 64 Hz aligned wearable dataset. It keeps the existing `python -m src.main` entry point, participant-level split integrity, train-only normalization, diagnostics, metrics, and checkpointing, while using a context-assisted sequence formulation instead of any row-wise classifier behavior.
 
-The model is not treated as a row-wise classifier. Each supervised example is one contiguous multichannel time series with shape:
+Each supervised example is one contiguous multichannel time series with shape:
 
 ```text
 [batch, channels, time]
 ```
 
-and each example produces one sleep-stage label for the target segment.
+and each example produces one sleep-stage label for the center target segment.
 
 The supervised target remains `Sleep_Stage` with five classes:
 
@@ -101,7 +101,7 @@ Normalization statistics are computed from TRAIN participants only and saved to:
 outputs/normalization_stats.json
 ```
 
-## Sequence Windowing and Target Labels
+## Sequence Windowing and Context
 
 Window generation is configured in `src/config.py`.
 
@@ -114,33 +114,19 @@ Important sequence settings:
 - `RIGHT_CONTEXT`
 - `LABEL_PURITY_THRESHOLD`
 
-The underlying dataclass fields are:
-
-- `config.data.target_window_length`
-- `config.data.step`
-- `config.data.use_context_windows`
-- `config.data.left_context`
-- `config.data.right_context`
-- `config.data.label_purity_threshold`
-
-Each retained sample is a contiguous time sequence made from:
+Each retained sample is a contiguous input sequence made from:
 
 ```text
 left context + target segment + right context
 ```
 
-Examples:
+Default context-assisted setup:
 
-- standard sequence classification:
-  - `USE_CONTEXT_WINDOWS = False`
-  - model input = target segment only
-  - label = target segment only
-- context-assisted sequence classification:
-  - `TARGET_WINDOW_LENGTH = 256`
-  - `LEFT_CONTEXT = 256`
-  - `RIGHT_CONTEXT = 256`
-  - total model input length = `768`
-  - label still comes from the center target segment only
+- `TARGET_WINDOW_LENGTH = 256`
+- `LEFT_CONTEXT = 256`
+- `RIGHT_CONTEXT = 256`
+- total model input length = `768`
+- the label still comes from the center target segment only
 
 Important label behavior:
 
@@ -194,58 +180,110 @@ Train-time statistics are restricted to TRAIN data only:
 
 ## Model Options
 
-Model selection is controlled through `MODEL_NAME` in `src/config.py` and exposed as `config.model.model_name`.
+Model selection is controlled through `MODEL_NAME` in `src/config.py`.
 
 Supported values:
 
 - `cnn_baseline`
 - `cnn_bilstm`
+- `cnn_bilstm_target_pool`
 
-`cnn_baseline` uses residual 1D convolution blocks to extract temporal features, then pools only over the target region representation.
+The recommended default is `cnn_bilstm_target_pool`.
 
-`cnn_bilstm` uses the same temporal CNN stem, converts features to `[batch, seq_len, feature_dim]`, runs a bidirectional LSTM over time, and then pools only over the target-region outputs.
+`cnn_baseline` uses residual 1D convolution blocks and target-aware pooling over the encoded temporal sequence.
 
-This is the key target-region behavior:
+`cnn_bilstm_target_pool` uses:
 
-- context can help the CNN or BiLSTM build better temporal features
-- the final classifier does not blindly pool over the whole input
-- the final pooled representation is computed from the target region only
+- a Conv1d feature extractor for local temporal structure
+- a BiLSTM over the reduced temporal sequence
+- target-region-only pooling over BiLSTM outputs
+- a classifier head for `W`, `N1`, `N2`, `N3`, and `R`
 
-## Imbalance Handling and Loss Options
+Target-aware pooling is explicit:
 
-Training supports configurable class-imbalance handling from `src/config.py`:
+- target start and end indices are tracked through the pipeline
+- target bounds are downsampled through the CNN encoder
+- final pooling happens only over target-region outputs
+- context helps feature formation, but the final pooled representation still comes from the target region only
 
-- `USE_WEIGHTED_SAMPLER`
+The pooling module uses mean, max, and learned attention inside the target region to make better use of the center segment while still benefiting from surrounding temporal context.
+
+## Imbalance Handling and Ablations
+
+Training now exposes loss choice and sampling choice independently so ablations are easy to run from `src/config.py`.
+
+Important knobs:
+
 - `LOSS_NAME`
-- `LABEL_SMOOTHING`
+- `USE_WEIGHTED_SAMPLER`
 - `CLASS_WEIGHTING`
+- `LABEL_SMOOTHING`
 - `focal_gamma`
-- `focal_use_class_weights`
+- `focal_reduction`
 - `focal_alpha`
-
-The dataclass fields are:
-
-- `config.training.use_weighted_sampler`
-- `config.training.loss_name`
-- `config.training.label_smoothing`
-- `config.training.class_weighting_mode`
 
 Supported losses:
 
 - `cross_entropy`
 - `weighted_cross_entropy`
 - `focal_loss`
+- `weighted_focal_loss`
 
 Supported class-weighting modes:
 
-- `inverse_frequency`
 - `none`
+- `inverse_frequency`
+- `sqrt_inverse_frequency`
+
+Typical ablations are now straightforward:
+
+- weighted CE only:
+  - `LOSS_NAME = "weighted_cross_entropy"`
+  - `USE_WEIGHTED_SAMPLER = False`
+- focal only:
+  - `LOSS_NAME = "focal_loss"`
+  - `USE_WEIGHTED_SAMPLER = False`
+- weighted sampler only:
+  - `LOSS_NAME = "cross_entropy"`
+  - `USE_WEIGHTED_SAMPLER = True`
+- focal + sampler:
+  - `LOSS_NAME = "focal_loss"` or `weighted_focal_loss`
+  - `USE_WEIGHTED_SAMPLER = True`
+- weighted CE + no sampler:
+  - `LOSS_NAME = "weighted_cross_entropy"`
+  - `USE_WEIGHTED_SAMPLER = False`
+
+The current defaults are intentionally more conservative than stacking multiple aggressive imbalance tricks:
+
+- `MODEL_NAME = "cnn_bilstm_target_pool"`
+- `LOSS_NAME = "weighted_cross_entropy"`
+- `USE_WEIGHTED_SAMPLER = False`
+- `CLASS_WEIGHTING = "sqrt_inverse_frequency"`
+- `LABEL_SMOOTHING = 0.0`
 
 Class weights are computed from TRAIN target windows only and saved to:
 
 ```text
 outputs/class_weights.json
 ```
+
+## Regularization
+
+The training loop keeps practical regularization controls:
+
+- dropout
+- weight decay
+- label smoothing
+- gradient clipping
+- early stopping on validation macro F1
+
+Label smoothing is applied to cross-entropy losses and can be disabled easily by setting:
+
+```text
+LABEL_SMOOTHING = 0.0
+```
+
+For focal losses, label smoothing is not applied.
 
 ## Training Behavior
 
@@ -285,8 +323,18 @@ Saved metrics include:
 - weighted precision, recall, F1
 - per-class precision, recall, F1
 - per-class support
+- target distribution per class
 - prediction distribution per class
+- prediction-minus-target class deltas
 - confusion matrices as JSON/CSV/PNG
+
+Per-class CSV outputs now include both:
+
+- true support
+- predicted count
+- prediction-minus-target count and fraction
+
+This makes it easier to detect distorted prediction frequencies such as minority overprediction or major-class underprediction.
 
 Key artifacts:
 
@@ -306,8 +354,6 @@ Key artifacts:
 - `outputs/test/test_confusion_matrix.csv`
 - `outputs/test/test_confusion_matrix.png`
 - `outputs/run_summary.json`
-
-These artifacts are intended to make class-collapse and temporal-context issues easier to inspect, especially for `N3` and `R`.
 
 ## Local Setup
 
@@ -370,14 +416,10 @@ Edit `src/config.py` to change:
 - weighted sampling
 - loss selection
 - class-weighting mode
-- focal-loss gamma and alpha
+- focal gamma, alpha, and reduction
 - early stopping patience
 
 ## Troubleshooting
-
-### Dataset directory not found
-
-Set `DREAMT_DATASET_DIR` or place the CSV files under `dataset/data_64Hz`.
 
 ### Zero retained windows
 
@@ -389,17 +431,15 @@ Common causes:
 - `drop_ambiguous_windows` removes too many target windows
 - timestamp gaps are causing windows to be discarded
 
+### Predictions are too biased toward minority classes
+
+Try a less aggressive combination:
+
+- disable `USE_WEIGHTED_SAMPLER`
+- use `CLASS_WEIGHTING = "sqrt_inverse_frequency"` instead of full inverse weighting
+- compare `weighted_cross_entropy` against `focal_loss`
+- check `prediction_minus_target_count` fields in the saved metrics artifacts
+
 ### A supervised class is missing from the TRAIN split
 
 The pipeline raises an error if any of `W/N1/N2/N3/R` has zero TRAIN target windows because class weights and sampling would be ill-defined.
-
-### Validation macro F1 is still poor
-
-Check:
-
-- `outputs/class_weights.json`
-- `outputs/dataset_summary.json`
-- `outputs/validation/epochs/`
-- `outputs/test/test_per_class_metrics.csv`
-
-The first thing to inspect is usually whether predictions are collapsing into only one or two easier classes, or whether the target window is still too short to capture enough temporal context for `N3` and `R`.

@@ -94,11 +94,15 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
     logger.info("Using device: %s", device)
     logger.info("Dataset directory: %s", config.data.dataset_dir)
     logger.info(
-        "Configured model=%s | loss=%s | weighted_sampler=%s | class_weighting=%s",
+        (
+            "Configured model=%s | loss=%s | weighted_sampler=%s | "
+            "class_weighting=%s | label_smoothing=%.3f"
+        ),
         config.model.model_name,
         config.training.loss_name,
         config.training.use_weighted_sampler,
         config.training.class_weighting_mode,
+        config.training.label_smoothing,
     )
     _log_sequence_configuration(logger, config.data)
 
@@ -245,7 +249,7 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
         output_path=config.paths.class_weights_path,
     )
     logger.info(
-        "Class weights computed from TRAIN windows only | mode=%s | %s",
+        "Class weights computed from TRAIN target windows only | mode=%s | %s",
         config.training.class_weighting_mode,
         _format_named_values(
             {
@@ -363,6 +367,7 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
                     "per_class",
                     "target_distribution",
                     "prediction_distribution",
+                    "distribution_shift",
                     "confusion_matrix",
                     "num_examples",
                     "split",
@@ -393,6 +398,10 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
         logger.info(
             "Validation prediction distribution | %s",
             _format_distribution(val_metrics["prediction_distribution"]),
+        )
+        logger.info(
+            "Validation prediction minus target | %s",
+            _format_distribution_shift(val_metrics["distribution_shift"]),
         )
 
         if val_metrics["macro_f1"] > (best_val_macro_f1 + config.training.min_delta):
@@ -481,6 +490,10 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
     logger.info(
         "Test prediction distribution | %s",
         _format_distribution(test_metrics["prediction_distribution"]),
+    )
+    logger.info(
+        "Test prediction minus target | %s",
+        _format_distribution_shift(test_metrics["distribution_shift"]),
     )
 
     summary = {
@@ -585,6 +598,10 @@ def _compute_class_weights(
         total = counts.sum().float()
         weights = total / (counts.float() * float(num_classes))
         weights = weights / weights.mean()
+    elif class_weighting_mode == "sqrt_inverse_frequency":
+        total = counts.sum().float()
+        weights = torch.sqrt(total / (counts.float() * float(num_classes)))
+        weights = weights / weights.mean()
     else:
         weights = torch.ones(num_classes, dtype=torch.float32)
 
@@ -656,7 +673,7 @@ def _build_training_criterion(
     if config.training.focal_alpha is not None:
         focal_alpha = torch.tensor(config.training.focal_alpha, dtype=torch.float32, device=device)
         focal_alpha_description = "config_focal_alpha"
-    elif config.training.focal_use_class_weights:
+    elif config.training.loss_name == "weighted_focal_loss":
         focal_alpha = class_weights.to(device)
         focal_alpha_description = f"train_window_{config.training.class_weighting_mode}"
 
@@ -664,11 +681,13 @@ def _build_training_criterion(
         FocalLoss(
             gamma=config.training.focal_gamma,
             alpha=focal_alpha,
+            reduction=config.training.focal_reduction,
         ),
         (
-            "focal_loss("
+            f"{config.training.loss_name}("
             f"gamma={config.training.focal_gamma:.3f}, "
             f"alpha={focal_alpha_description}, "
+            f"reduction={config.training.focal_reduction}, "
             f"label_smoothing_applied={False})"
         ),
     )
@@ -703,7 +722,11 @@ def _train_one_epoch(
             target_start_indices=target_start_indices,
             target_end_indices=target_end_indices,
         )
-        loss = criterion(logits, targets)
+        raw_loss = criterion(logits, targets)
+        if raw_loss.ndim > 0:
+            loss = raw_loss.mean()
+        else:
+            loss = raw_loss
         loss.backward()
 
         if gradient_clip_norm > 0:
@@ -712,9 +735,16 @@ def _train_one_epoch(
         optimizer.step()
 
         batch_size = targets.size(0)
-        total_loss += float(loss.item()) * batch_size
+        if raw_loss.ndim > 0:
+            display_loss = raw_loss.mean()
+        elif getattr(criterion, "reduction", None) == "sum":
+            display_loss = raw_loss / max(batch_size, 1)
+        else:
+            display_loss = raw_loss
+
+        total_loss += float(display_loss.item()) * batch_size
         total_examples += batch_size
-        progress.set_postfix(loss=f"{loss.item():.4f}")
+        progress.set_postfix(loss=f"{display_loss.item():.4f}")
 
     if total_examples == 0:
         raise ValueError("No training samples were available for this epoch.")
@@ -843,6 +873,17 @@ def _format_distribution(distribution: dict[str, dict[str, float]]) -> str:
         f"{label}={stats['count']}"
         for label, stats in distribution.items()
     ]
+    return ", ".join(parts)
+
+
+def _format_distribution_shift(distribution_shift: dict[str, dict[str, float]]) -> str:
+    """Render prediction-minus-target count deltas in a compact log string."""
+
+    parts = []
+    for label, stats in distribution_shift.items():
+        parts.append(
+            f"{label}={stats['count_delta']:+d} ({stats['fraction_delta']:+.3f})"
+        )
     return ", ".join(parts)
 
 

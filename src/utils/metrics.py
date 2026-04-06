@@ -75,6 +75,21 @@ def compute_classification_metrics(
                 if total_predictions
                 else 0.0
             ),
+            "prediction_minus_target_count": int(
+                prediction_counts.get(index, 0) - class_support[index]
+            ),
+            "prediction_minus_target_fraction": (
+                (
+                    float(prediction_counts.get(index, 0)) / float(total_predictions)
+                    if total_predictions
+                    else 0.0
+                )
+                - (
+                    float(class_support[index]) / float(total_targets)
+                    if total_targets
+                    else 0.0
+                )
+            ),
         }
         for index, label_name in enumerate(label_names)
     }
@@ -97,6 +112,13 @@ def compute_classification_metrics(
         "prediction_distribution": _build_distribution(
             counts=prediction_counts,
             total=total_predictions,
+            label_names=label_names,
+        ),
+        "distribution_shift": _build_distribution_shift(
+            target_counts=target_counts,
+            prediction_counts=prediction_counts,
+            total_targets=total_targets,
+            total_predictions=total_predictions,
             label_names=label_names,
         ),
         "confusion_matrix": matrix.tolist(),
@@ -189,6 +211,8 @@ def save_per_class_metrics_csv(
                 "support_fraction": metrics["support_fraction"],
                 "predicted_count": metrics["predicted_count"],
                 "predicted_fraction": metrics["predicted_fraction"],
+                "prediction_minus_target_count": metrics["prediction_minus_target_count"],
+                "prediction_minus_target_fraction": metrics["prediction_minus_target_fraction"],
             }
         )
 
@@ -204,6 +228,8 @@ def save_per_class_metrics_csv(
             "support_fraction",
             "predicted_count",
             "predicted_fraction",
+            "prediction_minus_target_count",
+            "prediction_minus_target_fraction",
         ],
     )
 
@@ -259,3 +285,33 @@ def _build_distribution(
             "fraction": (float(count) / float(total)) if total else 0.0,
         }
     return distribution
+
+
+def _build_distribution_shift(
+    target_counts: Counter[int],
+    prediction_counts: Counter[int],
+    total_targets: int,
+    total_predictions: int,
+    label_names: Sequence[str],
+) -> dict[str, dict[str, float]]:
+    """Compare predicted frequency against true frequency for each class."""
+
+    shift: dict[str, dict[str, float]] = {}
+    for index, label_name in enumerate(label_names):
+        target_count = int(target_counts.get(index, 0))
+        prediction_count = int(prediction_counts.get(index, 0))
+        target_fraction = (float(target_count) / float(total_targets)) if total_targets else 0.0
+        prediction_fraction = (
+            float(prediction_count) / float(total_predictions)
+            if total_predictions
+            else 0.0
+        )
+        shift[label_name] = {
+            "target_count": target_count,
+            "prediction_count": prediction_count,
+            "count_delta": prediction_count - target_count,
+            "target_fraction": target_fraction,
+            "prediction_fraction": prediction_fraction,
+            "fraction_delta": prediction_fraction - target_fraction,
+        }
+    return shift

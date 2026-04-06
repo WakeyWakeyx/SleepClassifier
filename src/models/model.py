@@ -119,7 +119,14 @@ class TemporalConvEncoder(nn.Module):
         target_end_indices: torch.Tensor | None,
         encoded_length: int,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Project input-space target bounds onto the encoder's reduced time axis."""
+        """Project input-space target bounds onto the encoder's reduced time axis.
+
+        Convolution blocks preserve sequence length because they use symmetric
+        padding. Only the intermediate max-pooling stages reduce the time axis.
+        The target region is mapped with floor/ceil style bounds so that any
+        encoded timestep whose pooled receptive field overlaps the target span is
+        retained for target-aware pooling.
+        """
 
         if target_start_indices is None or target_end_indices is None:
             return None, None
@@ -138,6 +145,64 @@ class TemporalConvEncoder(nn.Module):
         reduced_ends = torch.maximum(reduced_ends, reduced_starts + 1)
         reduced_ends = reduced_ends.clamp(max=encoded_length)
         return reduced_starts, reduced_ends
+
+
+class TargetRegionAttentionPooling(nn.Module):
+    """Pool only over the target region using stats plus attention within that region."""
+
+    def __init__(self, feature_dim: int, dropout: float) -> None:
+        super().__init__()
+        attention_hidden_dim = max(feature_dim // 2, 32)
+        self.attention = nn.Sequential(
+            nn.LayerNorm(feature_dim),
+            nn.Linear(feature_dim, attention_hidden_dim),
+            nn.Tanh(),
+            nn.Dropout(p=dropout),
+            nn.Linear(attention_hidden_dim, 1),
+        )
+        self.output_norm = nn.LayerNorm(feature_dim * 3)
+
+    def forward(
+        self,
+        sequence_features: torch.Tensor,
+        target_start_indices: torch.Tensor | None,
+        target_end_indices: torch.Tensor | None,
+    ) -> torch.Tensor:
+        target_mask = _build_target_mask(
+            sequence_length=sequence_features.size(1),
+            batch_size=sequence_features.size(0),
+            device=sequence_features.device,
+            target_start_indices=target_start_indices,
+            target_end_indices=target_end_indices,
+        )
+        expanded_mask = target_mask.unsqueeze(-1)
+
+        masked_sum = sequence_features.masked_fill(~expanded_mask, 0.0).sum(dim=1)
+        target_lengths = expanded_mask.sum(dim=1).clamp_min(1).to(sequence_features.dtype)
+        mean_features = masked_sum / target_lengths
+
+        mask_fill_value = torch.finfo(sequence_features.dtype).min
+        masked_max = sequence_features.masked_fill(~expanded_mask, mask_fill_value)
+        max_features = masked_max.amax(dim=1)
+
+        attention_logits = self.attention(sequence_features).squeeze(-1)
+        attention_logits = attention_logits.masked_fill(~target_mask, mask_fill_value)
+        attention_weights = torch.softmax(attention_logits, dim=1)
+        attention_weights = attention_weights.masked_fill(~target_mask, 0.0)
+        attention_weights = attention_weights / attention_weights.sum(
+            dim=1,
+            keepdim=True,
+        ).clamp_min(1e-6)
+        attention_features = torch.bmm(
+            attention_weights.unsqueeze(1),
+            sequence_features,
+        ).squeeze(1)
+
+        pooled_features = torch.cat(
+            [mean_features, max_features, attention_features],
+            dim=1,
+        )
+        return self.output_norm(pooled_features)
 
 
 class MLPClassifier(nn.Module):
@@ -163,7 +228,7 @@ class MLPClassifier(nn.Module):
 
 
 class SleepStageCNNBaseline(nn.Module):
-    """Residual-style CNN baseline for multichannel time-series sequence windows."""
+    """Residual-style CNN baseline with target-aware pooling over encoded time steps."""
 
     def __init__(
         self,
@@ -181,8 +246,12 @@ class SleepStageCNNBaseline(nn.Module):
             kernel_sizes=kernel_sizes,
             dropout=dropout,
         )
+        self.target_pool = TargetRegionAttentionPooling(
+            feature_dim=self.encoder.output_channels,
+            dropout=dropout,
+        )
         self.classifier = MLPClassifier(
-            input_dim=self.encoder.output_channels * 2,
+            input_dim=self.encoder.output_channels * 3,
             hidden_dim=classifier_hidden_dim,
             num_classes=num_classes,
             dropout=dropout,
@@ -203,7 +272,7 @@ class SleepStageCNNBaseline(nn.Module):
             target_end_indices=target_end_indices,
             encoded_length=sequence_features.size(1),
         )
-        pooled_features = _pool_sequence_region(
+        pooled_features = self.target_pool(
             sequence_features=sequence_features,
             target_start_indices=reduced_starts,
             target_end_indices=reduced_ends,
@@ -211,8 +280,8 @@ class SleepStageCNNBaseline(nn.Module):
         return self.classifier(pooled_features)
 
 
-class SleepStageCNNBiLSTM(nn.Module):
-    """CNN encoder followed by a BiLSTM over temporal feature steps."""
+class SleepStageCNNBiLSTMTargetPool(nn.Module):
+    """CNN encoder + BiLSTM with target-region-only pooling over BiLSTM outputs."""
 
     def __init__(
         self,
@@ -242,8 +311,12 @@ class SleepStageCNNBiLSTM(nn.Module):
             batch_first=True,
             bidirectional=True,
         )
+        self.target_pool = TargetRegionAttentionPooling(
+            feature_dim=lstm_hidden_size * 2,
+            dropout=dropout,
+        )
         self.classifier = MLPClassifier(
-            input_dim=lstm_hidden_size * 4,
+            input_dim=lstm_hidden_size * 6,
             hidden_dim=classifier_hidden_dim,
             num_classes=num_classes,
             dropout=dropout,
@@ -267,7 +340,7 @@ class SleepStageCNNBiLSTM(nn.Module):
             target_end_indices=target_end_indices,
             encoded_length=lstm_outputs.size(1),
         )
-        pooled_features = _pool_sequence_region(
+        pooled_features = self.target_pool(
             sequence_features=lstm_outputs,
             target_start_indices=reduced_starts,
             target_end_indices=reduced_ends,
@@ -289,8 +362,8 @@ def build_model(config: ModelConfig) -> nn.Module:
 
     if config.model_name == "cnn_baseline":
         return SleepStageCNNBaseline(**common_kwargs)
-    if config.model_name == "cnn_bilstm":
-        return SleepStageCNNBiLSTM(
+    if config.model_name in {"cnn_bilstm", "cnn_bilstm_target_pool"}:
+        return SleepStageCNNBiLSTMTargetPool(
             **common_kwargs,
             lstm_hidden_size=config.lstm_hidden_size,
             lstm_num_layers=config.lstm_num_layers,
@@ -299,45 +372,32 @@ def build_model(config: ModelConfig) -> nn.Module:
     raise ValueError(f"Unsupported model_name: {config.model_name}")
 
 
-def _pool_sequence_region(
-    sequence_features: torch.Tensor,
+def _build_target_mask(
+    sequence_length: int,
+    batch_size: int,
+    device: torch.device,
     target_start_indices: torch.Tensor | None,
     target_end_indices: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Pool only the target region so context informs features without owning the label."""
+    """Create a boolean mask for the target region on the current time axis."""
 
-    batch_size, sequence_length, _ = sequence_features.shape
     if target_start_indices is None or target_end_indices is None:
-        target_start_indices = torch.zeros(
-            batch_size,
-            dtype=torch.long,
-            device=sequence_features.device,
-        )
+        target_start_indices = torch.zeros(batch_size, dtype=torch.long, device=device)
         target_end_indices = torch.full(
             (batch_size,),
             fill_value=sequence_length,
             dtype=torch.long,
-            device=sequence_features.device,
+            device=device,
         )
     else:
-        target_start_indices = target_start_indices.to(sequence_features.device).long()
-        target_end_indices = target_end_indices.to(sequence_features.device).long()
+        target_start_indices = target_start_indices.to(device).long()
+        target_end_indices = target_end_indices.to(device).long()
 
-    time_indices = torch.arange(sequence_length, device=sequence_features.device).unsqueeze(0)
-    target_mask = (time_indices >= target_start_indices.unsqueeze(1)) & (
+    time_indices = torch.arange(sequence_length, device=device).unsqueeze(0)
+    return (time_indices >= target_start_indices.unsqueeze(1)) & (
         time_indices < target_end_indices.unsqueeze(1)
     )
-    target_mask = target_mask.unsqueeze(-1)
-
-    masked_sum = sequence_features.masked_fill(~target_mask, 0.0).sum(dim=1)
-    target_lengths = target_mask.sum(dim=1).clamp_min(1).to(sequence_features.dtype)
-    mean_features = masked_sum / target_lengths
-
-    mask_fill_value = torch.finfo(sequence_features.dtype).min
-    masked_max = sequence_features.masked_fill(~target_mask, mask_fill_value)
-    max_features = masked_max.amax(dim=1)
-
-    return torch.cat([mean_features, max_features], dim=1)
 
 
 SleepStageCNN = SleepStageCNNBaseline
+SleepStageCNNBiLSTM = SleepStageCNNBiLSTMTargetPool
