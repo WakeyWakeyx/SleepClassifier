@@ -50,7 +50,13 @@ def evaluate_model(
             target_start_indices=target_start_indices,
             target_end_indices=target_end_indices,
         )
-        loss = criterion(logits, targets)
+        raw_loss = criterion(logits, targets)
+        if raw_loss.ndim > 0:
+            loss = raw_loss.mean()
+        elif getattr(criterion, "reduction", None) == "sum":
+            loss = raw_loss / max(targets.size(0), 1)
+        else:
+            loss = raw_loss
 
         batch_size = targets.size(0)
         total_loss += float(loss.item()) * batch_size

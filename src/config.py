@@ -31,12 +31,13 @@ RIGHT_CONTEXT = 256
 LABEL_PURITY_THRESHOLD = 0.80
 
 # Frequently tuned training/model defaults exposed as clear top-level knobs.
-MODEL_NAME = "cnn_bilstm"
+MODEL_NAME = "cnn_bilstm_target_pool"
 DROPOUT = 0.40
-LOSS_NAME = "cross_entropy"
-LABEL_SMOOTHING = 0.05
-USE_WEIGHTED_SAMPLER = True
-CLASS_WEIGHTING = "inverse_frequency"
+LOSS_NAME = "weighted_cross_entropy"
+LABEL_SMOOTHING = 0.0
+USE_WEIGHTED_SAMPLER = False
+CLASS_WEIGHTING = "sqrt_inverse_frequency"
+FOCAL_REDUCTION = "mean"
 
 
 def _default_dataset_dir() -> Path:
@@ -159,7 +160,7 @@ class TrainingConfig:
     label_smoothing: float = LABEL_SMOOTHING
     class_weighting_mode: str = CLASS_WEIGHTING
     focal_gamma: float = 2.0
-    focal_use_class_weights: bool = True
+    focal_reduction: str = FOCAL_REDUCTION
     focal_alpha: tuple[float, ...] | None = None
 
 
@@ -214,8 +215,14 @@ def build_config() -> ProjectConfig:
         raise ValueError(
             "Model num_classes must match the number of configured label names."
         )
-    if config.model.model_name not in {"cnn_baseline", "cnn_bilstm"}:
-        raise ValueError("model_name must be 'cnn_baseline' or 'cnn_bilstm'.")
+    if config.model.model_name not in {
+        "cnn_baseline",
+        "cnn_bilstm",
+        "cnn_bilstm_target_pool",
+    }:
+        raise ValueError(
+            "model_name must be 'cnn_baseline', 'cnn_bilstm', or 'cnn_bilstm_target_pool'."
+        )
     if len(config.model.conv_channels) != len(config.model.kernel_sizes):
         raise ValueError("conv_channels and kernel_sizes must have the same length.")
     if not config.model.conv_channels:
@@ -250,16 +257,27 @@ def build_config() -> ProjectConfig:
         "cross_entropy",
         "weighted_cross_entropy",
         "focal_loss",
+        "weighted_focal_loss",
     }:
         raise ValueError(
-            "loss_name must be one of: cross_entropy, weighted_cross_entropy, focal_loss."
+            "loss_name must be one of: cross_entropy, weighted_cross_entropy, "
+            "focal_loss, weighted_focal_loss."
         )
-    if config.training.class_weighting_mode not in {"none", "inverse_frequency"}:
-        raise ValueError("class_weighting_mode must be 'none' or 'inverse_frequency'.")
+    if config.training.class_weighting_mode not in {
+        "none",
+        "inverse_frequency",
+        "sqrt_inverse_frequency",
+    }:
+        raise ValueError(
+            "class_weighting_mode must be 'none', 'inverse_frequency', "
+            "or 'sqrt_inverse_frequency'."
+        )
     if not 0.0 <= config.training.label_smoothing < 1.0:
         raise ValueError("label_smoothing must be in the interval [0, 1).")
     if config.training.focal_gamma < 0.0:
         raise ValueError("focal_gamma must be non-negative.")
+    if config.training.focal_reduction not in {"mean", "sum", "none"}:
+        raise ValueError("focal_reduction must be 'mean', 'sum', or 'none'.")
     if (
         config.training.focal_alpha is not None
         and len(config.training.focal_alpha) != config.model.num_classes
