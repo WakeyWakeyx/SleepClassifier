@@ -195,10 +195,10 @@ The recommended default is `cnn_bilstm_target_pool`.
 
 `cnn_bilstm_target_pool` uses:
 
-- a Conv1d feature extractor for local temporal structure
+- a residual Conv1d feature extractor with configurable temporal dilations for longer receptive fields
 - a BiLSTM over the reduced temporal sequence
 - explicit target-region pooling over BiLSTM outputs
-- optional pooled context summaries outside the target region
+- optional directional left/right context summaries outside the target region
 - a classifier head for `W`, `N1`, `N2`, `N3`, and `R`
 
 `cnn_bilstm` is kept as a backward-compatible alias of the same CNN+BiLSTM implementation.
@@ -212,6 +212,11 @@ Target-aware modeling is explicit:
 - context still never changes the assigned target label
 
 The pooling module uses mean, max, and learned attention statistics. When context pooling is enabled, the classifier sees target features, context features, and their difference, which makes the center segment easier to distinguish from surrounding transition context.
+
+Important model knobs that now matter for temporal structure:
+
+- `conv_dilations`
+- `separate_context_regions`
 
 ## Imbalance Handling and Ablations
 
@@ -233,6 +238,7 @@ Supported losses:
 
 - `cross_entropy`
 - `weighted_cross_entropy`
+- `balanced_softmax`
 - `focal_loss`
 - `weighted_focal_loss`
 
@@ -261,15 +267,17 @@ Typical ablations are now straightforward:
   - `LOSS_NAME = "weighted_cross_entropy"`
   - `USE_WEIGHTED_SAMPLER = False`
 
-The current defaults are intentionally more conservative than stacking multiple aggressive imbalance tricks:
+The current defaults are aimed at reducing the observed `N2` overprediction without stacking sampler-based rebalancing on top:
 
 - `MODEL_NAME = "cnn_bilstm_target_pool"`
-- `LOSS_NAME = "weighted_cross_entropy"`
+- `LOSS_NAME = "balanced_softmax"`
 - `USE_WEIGHTED_SAMPLER = False`
 - `CLASS_WEIGHTING = "sqrt_inverse_frequency"`
 - `SAMPLER_WEIGHTING = "inverse_frequency"`
 - `CLASS_BALANCE_BETA = 0.9999`
 - `LABEL_SMOOTHING = 0.0`
+
+`balanced_softmax` uses train-window class counts directly inside the softmax normalization. It is useful when plain or weighted cross-entropy still collapses too hard toward dominant stages such as `N2`.
 
 Class-count and weighting diagnostics are computed from TRAIN target windows only and saved to:
 
@@ -322,8 +330,10 @@ Runtime diagnostics now log:
 - current learning rate
 - epoch duration
 - training throughput in examples/second
-- CUDA peak memory when running on GPU
+- CUDA peak memory and fraction of total device memory when running on GPU
 - batch size, eval batch size, worker count, pin-memory, AMP, and TF32 settings
+- split-level timings for `load_participant_files`, `clean_participant_frame`, `WindowedSleepDataset(...)`, and `dataset.label_counts()`
+- how many participants in each split have zero retained windows for each class
 
 If context windows are enabled, training logs include:
 
@@ -431,6 +441,7 @@ Edit `src/config.py` to change:
 - label purity and valid-label thresholds
 - ambiguous-window handling
 - model type, CNN/LSTM dimensions, and target/context fusion behavior
+- convolution dilations and directional context pooling behavior
 - target indicator and relative-position input channels
 - dropout
 - batch size and evaluation batch size
@@ -459,7 +470,7 @@ Common causes:
 - `drop_ambiguous_windows` removes too many target windows
 - timestamp gaps are causing windows to be discarded
 
-### Predictions are too biased toward minority classes
+### Predictions are too biased toward one class
 
 Try a less aggressive combination:
 
@@ -467,8 +478,9 @@ Try a less aggressive combination:
 - use `CLASS_WEIGHTING = "sqrt_inverse_frequency"` instead of full inverse weighting
 - compare `CLASS_WEIGHTING = "effective_number"` against the frequency-based modes
 - keep `SAMPLER_WEIGHTING` and `CLASS_WEIGHTING` as separate ablations rather than assuming they should match
-- compare `weighted_cross_entropy` against `focal_loss`
+- compare `balanced_softmax` against `weighted_cross_entropy` and `focal_loss`
 - check `prediction_minus_target_count` fields in the saved metrics artifacts
+- check the split-level `participants missing each class` logs before blaming the loss alone
 
 ### A supervised class is missing from the TRAIN split
 
