@@ -38,6 +38,18 @@ class WindowMetadata:
     label_index: int
 
 
+@dataclass(slots=True, frozen=True)
+class WindowAssignment:
+    """Resolved label assignment and ambiguity diagnostics for one target segment."""
+
+    label_index: int | None
+    candidate_label_index: int | None
+    purity_reference_label_index: int | None
+    purity: float
+    is_ambiguous: bool
+    discard_reason: str | None
+
+
 @dataclass(slots=True)
 class ParticipantWindowReport:
     """Structured per-participant windowing diagnostics."""
@@ -50,7 +62,11 @@ class ParticipantWindowReport:
     discarded_windows: int
     ambiguous_windows_kept: int
     too_short_for_windowing: bool
+    candidate_class_counts: dict[str, int]
     kept_class_counts: dict[str, int]
+    actual_purity_discards_by_class: dict[str, int]
+    purity_threshold_failures_by_class: dict[str, int]
+    discarded_class_counts_by_reason: dict[str, dict[str, int]]
     discard_reasons: dict[str, int]
 
     def to_dict(self) -> dict[str, Any]:
@@ -65,7 +81,14 @@ class ParticipantWindowReport:
             "discarded_windows": self.discarded_windows,
             "ambiguous_windows_kept": self.ambiguous_windows_kept,
             "too_short_for_windowing": self.too_short_for_windowing,
+            "candidate_class_counts": dict(self.candidate_class_counts),
             "kept_class_counts": dict(self.kept_class_counts),
+            "actual_purity_discards_by_class": dict(self.actual_purity_discards_by_class),
+            "purity_threshold_failures_by_class": dict(self.purity_threshold_failures_by_class),
+            "discarded_class_counts_by_reason": {
+                reason: dict(counts)
+                for reason, counts in self.discarded_class_counts_by_reason.items()
+            },
             "discard_reasons": dict(self.discard_reasons),
         }
 
@@ -94,6 +117,10 @@ class WindowedSleepDataset(Dataset[WindowSample]):
         self.participant_summaries: list[dict[str, Any]] = []
 
         aggregate_reasons: Counter[str] = Counter()
+        aggregate_candidate_class_counts: Counter[str] = Counter()
+        aggregate_actual_purity_discards: Counter[str] = Counter()
+        aggregate_purity_threshold_failures: Counter[str] = Counter()
+        aggregate_discarded_class_counts_by_reason: dict[str, Counter[str]] = {}
 
         for participant_index, participant in enumerate(participants):
             signal_array = participant.frame.loc[:, self.feature_columns].to_numpy(
@@ -127,6 +154,17 @@ class WindowedSleepDataset(Dataset[WindowSample]):
             label_buffer.extend(window.label_index for window in participant_windows)
             self.participant_summaries.append(participant_summary.to_dict())
             aggregate_reasons.update(participant_summary.discard_reasons)
+            aggregate_candidate_class_counts.update(participant_summary.candidate_class_counts)
+            aggregate_actual_purity_discards.update(
+                participant_summary.actual_purity_discards_by_class
+            )
+            aggregate_purity_threshold_failures.update(
+                participant_summary.purity_threshold_failures_by_class
+            )
+            for reason, class_counts in participant_summary.discarded_class_counts_by_reason.items():
+                aggregate_discarded_class_counts_by_reason.setdefault(reason, Counter()).update(
+                    class_counts
+                )
 
         self.labels = np.asarray(label_buffer, dtype=np.int64)
         label_counts = self.label_counts()
@@ -139,6 +177,13 @@ class WindowedSleepDataset(Dataset[WindowSample]):
         participants_with_no_kept_windows = sum(
             int(report["kept_windows"] == 0) for report in self.participant_summaries
         )
+        overall_purity_failure_total = int(sum(aggregate_purity_threshold_failures.values()))
+        overall_candidate_total = int(sum(aggregate_candidate_class_counts.values()))
+        overall_purity_failure_rate = (
+            overall_purity_failure_total / overall_candidate_total
+            if overall_candidate_total
+            else 0.0
+        )
         self.summary: dict[str, Any] = {
             "participants": len(participants),
             "candidate_windows": int(total_candidate_windows),
@@ -146,7 +191,33 @@ class WindowedSleepDataset(Dataset[WindowSample]):
             "discarded_windows": int(total_candidate_windows - len(self.samples)),
             "ambiguous_windows_kept": int(total_ambiguous_windows_kept),
             "participants_with_no_kept_windows": int(participants_with_no_kept_windows),
+            "candidate_class_counts": _counter_to_label_counts(
+                aggregate_candidate_class_counts,
+                self.label_names,
+            ),
             "kept_class_counts": label_counts,
+            "actual_purity_discards_by_class": _counter_to_label_counts(
+                aggregate_actual_purity_discards,
+                self.label_names,
+            ),
+            "purity_threshold_failures_by_class": _counter_to_label_counts(
+                aggregate_purity_threshold_failures,
+                self.label_names,
+            ),
+            "purity_threshold_failure_rates_by_class": _compute_classwise_rates(
+                numerators=aggregate_purity_threshold_failures,
+                denominators=aggregate_candidate_class_counts,
+                label_names=self.label_names,
+            ),
+            "minority_purity_relative_loss": _build_relative_loss_summary(
+                rates=_compute_classwise_rates(
+                    numerators=aggregate_purity_threshold_failures,
+                    denominators=aggregate_candidate_class_counts,
+                    label_names=self.label_names,
+                ),
+                baseline_rate=overall_purity_failure_rate,
+                label_names=self.label_names,
+            ),
             "participants_missing_each_class": {
                 label_name: int(
                     sum(
@@ -160,6 +231,10 @@ class WindowedSleepDataset(Dataset[WindowSample]):
                 reason: int(count)
                 for reason, count in sorted(aggregate_reasons.items())
                 if count > 0
+            },
+            "discarded_class_counts_by_reason": {
+                reason: _counter_to_label_counts(class_counts, self.label_names)
+                for reason, class_counts in sorted(aggregate_discarded_class_counts_by_reason.items())
             },
             "sequence_definition": _build_sequence_definition(data_config),
             "participant_summaries": self.participant_summaries,
@@ -267,7 +342,11 @@ def _generate_windows_for_participant(
             discarded_windows=0,
             ambiguous_windows_kept=0,
             too_short_for_windowing=True,
+            candidate_class_counts=_empty_label_counts(label_names),
             kept_class_counts=_empty_label_counts(label_names),
+            actual_purity_discards_by_class=_empty_label_counts(label_names),
+            purity_threshold_failures_by_class=_empty_label_counts(label_names),
+            discarded_class_counts_by_reason={},
             discard_reasons={"too_short_for_windowing": 1},
         )
         return windows, report
@@ -294,6 +373,10 @@ def _generate_windows_for_participant(
     )
     candidate_windows = 0
     ambiguous_windows_kept = 0
+    candidate_label_counts: Counter[int] = Counter()
+    actual_purity_discards_by_class: Counter[int] = Counter()
+    purity_threshold_failures_by_class: Counter[int] = Counter()
+    discarded_class_counts_by_reason: dict[str, Counter[int]] = {}
 
     for target_start_index in _candidate_target_start_indices(total_rows, data_config):
         candidate_windows += 1
@@ -321,14 +404,30 @@ def _generate_windows_for_participant(
             ],
             dtype=np.int64,
         )
-        majority_class = int(class_counts.argmax())
-        majority_count = int(class_counts[majority_class])
-        purity = majority_count / valid_count
-
-        if purity < data_config.label_purity_threshold and data_config.drop_ambiguous_windows:
-            discard_reasons["insufficient_purity"] += 1
+        assignment = _resolve_window_assignment(
+            class_counts=class_counts,
+            encoded_labels=encoded_labels,
+            target_start_index=target_start_index,
+            target_end_index=target_end_index,
+            valid_count=valid_count,
+            data_config=data_config,
+        )
+        if assignment.candidate_label_index is not None:
+            candidate_label_counts[assignment.candidate_label_index] += 1
+        if assignment.is_ambiguous and assignment.purity_reference_label_index is not None:
+            purity_threshold_failures_by_class[assignment.purity_reference_label_index] += 1
+        if assignment.discard_reason is not None:
+            discard_reasons[assignment.discard_reason] += 1
+            if assignment.discard_reason == "insufficient_purity":
+                if assignment.purity_reference_label_index is not None:
+                    actual_purity_discards_by_class[assignment.purity_reference_label_index] += 1
+            if assignment.candidate_label_index is not None:
+                discarded_class_counts_by_reason.setdefault(
+                    assignment.discard_reason,
+                    Counter(),
+                )[assignment.candidate_label_index] += 1
             continue
-        if purity < data_config.label_purity_threshold:
+        if assignment.is_ambiguous:
             ambiguous_windows_kept += 1
 
         windows.append(
@@ -338,7 +437,7 @@ def _generate_windows_for_participant(
                 input_end_index=input_end_index,
                 target_start_index=target_start_index,
                 target_end_index=target_end_index,
-                label_index=majority_class,
+                label_index=int(assignment.label_index),
             )
         )
 
@@ -352,9 +451,28 @@ def _generate_windows_for_participant(
         discarded_windows=candidate_windows - len(windows),
         ambiguous_windows_kept=ambiguous_windows_kept,
         too_short_for_windowing=False,
+        candidate_class_counts={
+            label_name: int(candidate_label_counts.get(index, 0))
+            for index, label_name in enumerate(label_names)
+        },
         kept_class_counts={
             label_name: int(kept_label_counts.get(index, 0))
             for index, label_name in enumerate(label_names)
+        },
+        actual_purity_discards_by_class={
+            label_name: int(actual_purity_discards_by_class.get(index, 0))
+            for index, label_name in enumerate(label_names)
+        },
+        purity_threshold_failures_by_class={
+            label_name: int(purity_threshold_failures_by_class.get(index, 0))
+            for index, label_name in enumerate(label_names)
+        },
+        discarded_class_counts_by_reason={
+            reason: {
+                label_name: int(class_counts_by_reason.get(index, 0))
+                for index, label_name in enumerate(label_names)
+            }
+            for reason, class_counts_by_reason in sorted(discarded_class_counts_by_reason.items())
         },
         discard_reasons={
             reason: int(count)
@@ -363,6 +481,95 @@ def _generate_windows_for_participant(
         },
     )
     return windows, report
+
+
+def _resolve_window_assignment(
+    class_counts: np.ndarray,
+    encoded_labels: np.ndarray,
+    target_start_index: int,
+    target_end_index: int,
+    valid_count: int,
+    data_config: DataConfig,
+) -> WindowAssignment:
+    """Assign one window label according to the configured target-labeling strategy."""
+
+    majority_class = int(class_counts.argmax())
+    majority_count = int(class_counts[majority_class])
+    purity = majority_count / valid_count
+    is_ambiguous = purity < data_config.label_purity_threshold
+
+    if data_config.target_label_strategy == "majority_vote":
+        return WindowAssignment(
+            label_index=majority_class,
+            candidate_label_index=majority_class,
+            purity_reference_label_index=majority_class,
+            purity=purity,
+            is_ambiguous=is_ambiguous,
+            discard_reason=None,
+        )
+
+    if data_config.target_label_strategy == "center_label":
+        center_start_index, center_end_index = _center_region_bounds(
+            target_start_index=target_start_index,
+            target_end_index=target_end_index,
+            center_label_span=data_config.center_label_span,
+        )
+        center_labels = encoded_labels[center_start_index:center_end_index]
+        valid_center_labels = center_labels[center_labels >= 0]
+        if valid_center_labels.size == 0:
+            return WindowAssignment(
+                label_index=None,
+                candidate_label_index=majority_class,
+                purity_reference_label_index=majority_class,
+                purity=purity,
+                is_ambiguous=is_ambiguous,
+                discard_reason="invalid_center_label",
+            )
+
+        center_class_counts = np.bincount(
+            valid_center_labels.astype(np.int64),
+            minlength=class_counts.shape[0],
+        )
+        center_class = int(center_class_counts.argmax())
+        return WindowAssignment(
+            label_index=center_class,
+            candidate_label_index=center_class,
+            purity_reference_label_index=majority_class,
+            purity=purity,
+            is_ambiguous=is_ambiguous,
+            discard_reason=None,
+        )
+
+    discard_reason = None
+    if is_ambiguous and data_config.drop_ambiguous_windows:
+        discard_reason = "insufficient_purity"
+
+    return WindowAssignment(
+        label_index=majority_class if discard_reason is None else None,
+        candidate_label_index=majority_class,
+        purity_reference_label_index=majority_class,
+        purity=purity,
+        is_ambiguous=is_ambiguous,
+        discard_reason=discard_reason,
+    )
+
+
+def _center_region_bounds(
+    target_start_index: int,
+    target_end_index: int,
+    center_label_span: int,
+) -> tuple[int, int]:
+    """Return the centered sub-region used by the center-label strategy."""
+
+    target_length = target_end_index - target_start_index
+    center_index = target_start_index + (target_length // 2)
+    half_span = center_label_span // 2
+    center_start_index = max(target_start_index, center_index - half_span)
+    center_end_index = min(target_end_index, center_index + half_span + 1)
+    if (center_end_index - center_start_index) < center_label_span:
+        center_start_index = max(target_start_index, center_end_index - center_label_span)
+        center_end_index = min(target_end_index, center_start_index + center_label_span)
+    return center_start_index, center_end_index
 
 
 def _candidate_target_start_indices(
@@ -410,12 +617,17 @@ def _window_crosses_gap(gap_prefix: np.ndarray, start_index: int, end_index: int
     return bool(gap_prefix[end_index - 1] - gap_prefix[start_index])
 
 
-def _build_sequence_definition(data_config: DataConfig) -> dict[str, int | bool]:
+def _build_sequence_definition(
+    data_config: DataConfig,
+) -> dict[str, int | float | bool | str]:
     """Serialize how each supervised sample is constructed."""
 
     return {
         "use_context_windows": data_config.use_context_windows,
         "target_window_length": data_config.target_window_length,
+        "target_label_strategy": data_config.target_label_strategy,
+        "center_label_span": data_config.center_label_span,
+        "label_purity_threshold": data_config.label_purity_threshold,
         "configured_left_context": data_config.left_context,
         "configured_right_context": data_config.right_context,
         "left_context": data_config.effective_left_context,
@@ -429,3 +641,49 @@ def _empty_label_counts(label_names: Sequence[str]) -> dict[str, int]:
     """Create a zero-filled label-count dictionary."""
 
     return {label_name: 0 for label_name in label_names}
+
+
+def _counter_to_label_counts(
+    counter: Counter[str] | Counter[int],
+    label_names: Sequence[str],
+) -> dict[str, int]:
+    """Render integer Counters into a stable label-keyed dictionary."""
+
+    return {
+        label_name: int(counter.get(index, counter.get(label_name, 0)))
+        for index, label_name in enumerate(label_names)
+    }
+
+
+def _compute_classwise_rates(
+    numerators: Counter[str] | Counter[int],
+    denominators: Counter[str] | Counter[int],
+    label_names: Sequence[str],
+) -> dict[str, float]:
+    """Compute per-class rates from aligned numerator and denominator counters."""
+
+    rates: dict[str, float] = {}
+    for index, label_name in enumerate(label_names):
+        numerator = float(numerators.get(index, numerators.get(label_name, 0)))
+        denominator = float(denominators.get(index, denominators.get(label_name, 0)))
+        rates[label_name] = numerator / denominator if denominator > 0.0 else 0.0
+    return rates
+
+
+def _build_relative_loss_summary(
+    rates: Mapping[str, float],
+    baseline_rate: float,
+    label_names: Sequence[str],
+) -> dict[str, dict[str, float]]:
+    """Compare each class purity-loss rate against the overall rate."""
+
+    summary: dict[str, dict[str, float]] = {}
+    for label_name in label_names:
+        rate = float(rates.get(label_name, 0.0))
+        summary[label_name] = {
+            "purity_failure_rate": rate,
+            "relative_to_overall": (
+                rate / baseline_rate if baseline_rate > 0.0 else 0.0
+            ),
+        }
+    return summary
