@@ -62,16 +62,30 @@ def load_json(path: Path) -> Any:
         return json.load(handle)
 
 
-def set_seed(seed: int) -> None:
-    """Set Python, NumPy, and PyTorch seeds for reproducibility."""
+def set_seed(
+    seed: int,
+    *,
+    deterministic: bool = False,
+    cudnn_benchmark: bool = True,
+    allow_tf32: bool = True,
+) -> None:
+    """Set random seeds and configure PyTorch runtime behavior."""
 
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        torch.backends.cudnn.allow_tf32 = allow_tf32
+
+    try:
+        torch.use_deterministic_algorithms(deterministic, warn_only=deterministic)
+    except TypeError:
+        torch.use_deterministic_algorithms(deterministic)
+
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = cudnn_benchmark if not deterministic else False
 
 
 def seed_worker(worker_id: int) -> None:
