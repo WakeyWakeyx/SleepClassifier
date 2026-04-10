@@ -18,16 +18,18 @@ class ResidualTemporalBlock(nn.Module):
         in_channels: int,
         out_channels: int,
         kernel_size: int,
+        dilation: int,
         dropout: float,
     ) -> None:
         super().__init__()
-        padding = kernel_size // 2
+        padding = dilation * (kernel_size // 2)
 
         self.conv1 = nn.Conv1d(
             in_channels=in_channels,
             out_channels=out_channels,
             kernel_size=kernel_size,
             padding=padding,
+            dilation=dilation,
             bias=False,
         )
         self.bn1 = nn.BatchNorm1d(out_channels)
@@ -36,6 +38,7 @@ class ResidualTemporalBlock(nn.Module):
             out_channels=out_channels,
             kernel_size=kernel_size,
             padding=padding,
+            dilation=dilation,
             bias=False,
         )
         self.bn2 = nn.BatchNorm1d(out_channels)
@@ -79,23 +82,32 @@ class TemporalConvEncoder(nn.Module):
         input_channels: int,
         conv_channels: Sequence[int],
         kernel_sizes: Sequence[int],
+        dilations: Sequence[int],
         dropout: float,
     ) -> None:
         super().__init__()
 
         if len(conv_channels) != len(kernel_sizes):
             raise ValueError("conv_channels and kernel_sizes must have the same length.")
+        if len(conv_channels) != len(dilations):
+            raise ValueError("conv_channels and dilations must have the same length.")
         if not conv_channels:
             raise ValueError("At least one convolutional block is required.")
 
         self.blocks = nn.ModuleList()
         current_channels = input_channels
-        for out_channels, kernel_size in zip(conv_channels, kernel_sizes, strict=True):
+        for out_channels, kernel_size, dilation in zip(
+            conv_channels,
+            kernel_sizes,
+            dilations,
+            strict=True,
+        ):
             self.blocks.append(
                 ResidualTemporalBlock(
                     in_channels=current_channels,
                     out_channels=out_channels,
                     kernel_size=kernel_size,
+                    dilation=dilation,
                     dropout=dropout,
                 )
             )
@@ -209,12 +221,17 @@ class TargetContextPooling(nn.Module):
         feature_dim: int,
         dropout: float,
         include_context_region: bool,
+        separate_context_regions: bool,
     ) -> None:
         super().__init__()
         self.include_context_region = include_context_region
+        self.separate_context_regions = separate_context_regions and include_context_region
         self.region_pool = MaskedRegionAttentionPooling(feature_dim=feature_dim, dropout=dropout)
 
-        if include_context_region:
+        if self.separate_context_regions:
+            self.output_dim = self.region_pool.output_dim * 5
+            self.output_norm = nn.LayerNorm(self.output_dim)
+        elif include_context_region:
             self.output_dim = self.region_pool.output_dim * 3
             self.output_norm = nn.LayerNorm(self.output_dim)
         else:
@@ -227,7 +244,7 @@ class TargetContextPooling(nn.Module):
         target_start_indices: torch.Tensor | None,
         target_end_indices: torch.Tensor | None,
     ) -> torch.Tensor:
-        target_mask = _build_target_mask(
+        target_mask, left_context_mask, right_context_mask = _build_region_masks(
             sequence_length=sequence_features.size(1),
             batch_size=sequence_features.size(0),
             device=sequence_features.device,
@@ -239,9 +256,30 @@ class TargetContextPooling(nn.Module):
         if not self.include_context_region:
             return target_features
 
+        if self.separate_context_regions:
+            left_context_features = self.region_pool(
+                sequence_features=sequence_features,
+                mask=left_context_mask,
+            )
+            right_context_features = self.region_pool(
+                sequence_features=sequence_features,
+                mask=right_context_mask,
+            )
+            fused_features = torch.cat(
+                [
+                    target_features,
+                    left_context_features,
+                    right_context_features,
+                    target_features - left_context_features,
+                    target_features - right_context_features,
+                ],
+                dim=1,
+            )
+            return self.output_norm(fused_features)
+
         context_features = self.region_pool(
             sequence_features=sequence_features,
-            mask=~target_mask,
+            mask=left_context_mask | right_context_mask,
         )
         fused_features = torch.cat(
             [
@@ -332,11 +370,13 @@ class SleepStageCNNBaseline(SequenceFeatureMixin, nn.Module):
         num_classes: int,
         conv_channels: Sequence[int],
         kernel_sizes: Sequence[int],
+        conv_dilations: Sequence[int],
         dropout: float,
         classifier_hidden_dim: int,
         use_target_indicator_channel: bool,
         use_relative_position_channel: bool,
         pool_context_region: bool,
+        separate_context_regions: bool,
     ) -> None:
         super().__init__()
         self.use_target_indicator_channel = use_target_indicator_channel
@@ -345,12 +385,14 @@ class SleepStageCNNBaseline(SequenceFeatureMixin, nn.Module):
             input_channels=input_channels + self.extra_input_channels,
             conv_channels=conv_channels,
             kernel_sizes=kernel_sizes,
+            dilations=conv_dilations,
             dropout=dropout,
         )
         self.target_pool = TargetContextPooling(
             feature_dim=self.encoder.output_channels,
             dropout=dropout,
             include_context_region=pool_context_region,
+            separate_context_regions=separate_context_regions,
         )
         self.classifier = MLPClassifier(
             input_dim=self.target_pool.output_dim,
@@ -394,6 +436,7 @@ class SleepStageCNNBiLSTMTargetPool(SequenceFeatureMixin, nn.Module):
         num_classes: int,
         conv_channels: Sequence[int],
         kernel_sizes: Sequence[int],
+        conv_dilations: Sequence[int],
         dropout: float,
         classifier_hidden_dim: int,
         lstm_hidden_size: int,
@@ -402,6 +445,7 @@ class SleepStageCNNBiLSTMTargetPool(SequenceFeatureMixin, nn.Module):
         use_target_indicator_channel: bool,
         use_relative_position_channel: bool,
         pool_context_region: bool,
+        separate_context_regions: bool,
     ) -> None:
         super().__init__()
         self.use_target_indicator_channel = use_target_indicator_channel
@@ -410,6 +454,7 @@ class SleepStageCNNBiLSTMTargetPool(SequenceFeatureMixin, nn.Module):
             input_channels=input_channels + self.extra_input_channels,
             conv_channels=conv_channels,
             kernel_sizes=kernel_sizes,
+            dilations=conv_dilations,
             dropout=dropout,
         )
         self.sequence_dropout = nn.Dropout(p=dropout)
@@ -425,6 +470,7 @@ class SleepStageCNNBiLSTMTargetPool(SequenceFeatureMixin, nn.Module):
             feature_dim=lstm_hidden_size * 2,
             dropout=dropout,
             include_context_region=pool_context_region,
+            separate_context_regions=separate_context_regions,
         )
         self.classifier = MLPClassifier(
             input_dim=self.target_pool.output_dim,
@@ -470,11 +516,13 @@ def build_model(config: ModelConfig) -> nn.Module:
         "num_classes": config.num_classes,
         "conv_channels": config.conv_channels,
         "kernel_sizes": config.kernel_sizes,
+        "conv_dilations": config.conv_dilations,
         "dropout": config.dropout,
         "classifier_hidden_dim": config.classifier_hidden_dim,
         "use_target_indicator_channel": config.use_target_indicator_channel,
         "use_relative_position_channel": config.use_relative_position_channel,
         "pool_context_region": config.pool_context_region,
+        "separate_context_regions": config.separate_context_regions,
     }
 
     if config.model_name == "cnn_baseline":
@@ -514,6 +562,36 @@ def _build_target_mask(
     return (time_indices >= target_start_indices.unsqueeze(1)) & (
         time_indices < target_end_indices.unsqueeze(1)
     )
+
+
+def _build_region_masks(
+    sequence_length: int,
+    batch_size: int,
+    device: torch.device,
+    target_start_indices: torch.Tensor | None,
+    target_end_indices: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Create target, left-context, and right-context masks on the current time axis."""
+
+    target_mask = _build_target_mask(
+        sequence_length=sequence_length,
+        batch_size=batch_size,
+        device=device,
+        target_start_indices=target_start_indices,
+        target_end_indices=target_end_indices,
+    )
+    time_indices = torch.arange(sequence_length, device=device).unsqueeze(0)
+
+    if target_start_indices is None or target_end_indices is None:
+        left_context_mask = torch.zeros_like(target_mask)
+        right_context_mask = torch.zeros_like(target_mask)
+    else:
+        target_start_indices = target_start_indices.to(device).long()
+        target_end_indices = target_end_indices.to(device).long()
+        left_context_mask = time_indices < target_start_indices.unsqueeze(1)
+        right_context_mask = time_indices >= target_end_indices.unsqueeze(1)
+
+    return target_mask, left_context_mask, right_context_mask
 
 
 SleepStageCNN = SleepStageCNNBaseline
