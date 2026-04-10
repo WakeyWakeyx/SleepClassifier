@@ -314,6 +314,24 @@ class MLPClassifier(nn.Module):
         return self.layers(inputs)
 
 
+class InputRegularization(nn.Module):
+    """Apply optional per-feature and per-channel dropout to raw inputs."""
+
+    def __init__(self, feature_dropout: float, channel_dropout: float) -> None:
+        super().__init__()
+        self.feature_dropout = (
+            nn.Dropout(p=feature_dropout) if feature_dropout > 0.0 else nn.Identity()
+        )
+        self.channel_dropout = (
+            nn.Dropout1d(p=channel_dropout) if channel_dropout > 0.0 else nn.Identity()
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        outputs = self.channel_dropout(inputs)
+        outputs = self.feature_dropout(outputs)
+        return outputs
+
+
 class SequenceFeatureMixin:
     """Add positional cues and the supervised target indicator to the inputs."""
 
@@ -372,6 +390,8 @@ class SleepStageCNNBaseline(SequenceFeatureMixin, nn.Module):
         kernel_sizes: Sequence[int],
         conv_dilations: Sequence[int],
         dropout: float,
+        feature_dropout: float,
+        channel_dropout: float,
         classifier_hidden_dim: int,
         use_target_indicator_channel: bool,
         use_relative_position_channel: bool,
@@ -381,6 +401,10 @@ class SleepStageCNNBaseline(SequenceFeatureMixin, nn.Module):
         super().__init__()
         self.use_target_indicator_channel = use_target_indicator_channel
         self.use_relative_position_channel = use_relative_position_channel
+        self.input_regularization = InputRegularization(
+            feature_dropout=feature_dropout,
+            channel_dropout=channel_dropout,
+        )
         self.encoder = TemporalConvEncoder(
             input_channels=input_channels + self.extra_input_channels,
             conv_channels=conv_channels,
@@ -407,6 +431,7 @@ class SleepStageCNNBaseline(SequenceFeatureMixin, nn.Module):
         target_start_indices: torch.Tensor | None = None,
         target_end_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        inputs = self.input_regularization(inputs)
         augmented_inputs = self._augment_inputs(
             inputs=inputs,
             target_start_indices=target_start_indices,
@@ -438,6 +463,8 @@ class SleepStageCNNBiLSTMTargetPool(SequenceFeatureMixin, nn.Module):
         kernel_sizes: Sequence[int],
         conv_dilations: Sequence[int],
         dropout: float,
+        feature_dropout: float,
+        channel_dropout: float,
         classifier_hidden_dim: int,
         lstm_hidden_size: int,
         lstm_num_layers: int,
@@ -450,6 +477,10 @@ class SleepStageCNNBiLSTMTargetPool(SequenceFeatureMixin, nn.Module):
         super().__init__()
         self.use_target_indicator_channel = use_target_indicator_channel
         self.use_relative_position_channel = use_relative_position_channel
+        self.input_regularization = InputRegularization(
+            feature_dropout=feature_dropout,
+            channel_dropout=channel_dropout,
+        )
         self.encoder = TemporalConvEncoder(
             input_channels=input_channels + self.extra_input_channels,
             conv_channels=conv_channels,
@@ -485,6 +516,7 @@ class SleepStageCNNBiLSTMTargetPool(SequenceFeatureMixin, nn.Module):
         target_start_indices: torch.Tensor | None = None,
         target_end_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        inputs = self.input_regularization(inputs)
         augmented_inputs = self._augment_inputs(
             inputs=inputs,
             target_start_indices=target_start_indices,
@@ -518,6 +550,8 @@ def build_model(config: ModelConfig) -> nn.Module:
         "kernel_sizes": config.kernel_sizes,
         "conv_dilations": config.conv_dilations,
         "dropout": config.dropout,
+        "feature_dropout": config.feature_dropout,
+        "channel_dropout": config.channel_dropout,
         "classifier_hidden_dim": config.classifier_hidden_dim,
         "use_target_indicator_channel": config.use_target_indicator_channel,
         "use_relative_position_channel": config.use_relative_position_channel,
