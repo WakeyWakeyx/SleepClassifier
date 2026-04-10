@@ -31,8 +31,6 @@ class WindowMetadata:
     """Metadata describing one retained supervised target segment and its input span."""
 
     participant_index: int
-    participant_id: str
-    source_path: str
     input_start_index: int
     input_end_index: int
     target_start_index: int
@@ -91,7 +89,7 @@ class WindowedSleepDataset(Dataset[WindowSample]):
             for label_name, _ in sorted(label_to_index.items(), key=lambda item: item[1])
         )
         self.samples: list[WindowMetadata] = []
-        self.labels: list[int] = []
+        label_buffer: list[int] = []
         self._signals: list[np.ndarray] = []
         self.participant_summaries: list[dict[str, Any]] = []
 
@@ -100,8 +98,9 @@ class WindowedSleepDataset(Dataset[WindowSample]):
         for participant_index, participant in enumerate(participants):
             signal_array = participant.frame.loc[:, self.feature_columns].to_numpy(
                 dtype=np.float32,
-                copy=True,
+                copy=False,
             )
+            signal_array = np.ascontiguousarray(signal_array.T)
             timestamp_array = participant.frame.loc[:, data_config.timestamp_column].to_numpy(
                 dtype=np.float64,
                 copy=False,
@@ -114,6 +113,7 @@ class WindowedSleepDataset(Dataset[WindowSample]):
             )
 
             self._signals.append(signal_array)
+            participant.frame = participant.frame.iloc[0:0]
             participant_windows, participant_summary = _generate_windows_for_participant(
                 participant_index=participant_index,
                 participant_id=participant.participant_id,
@@ -124,10 +124,11 @@ class WindowedSleepDataset(Dataset[WindowSample]):
                 label_names=self.label_names,
             )
             self.samples.extend(participant_windows)
-            self.labels.extend(window.label_index for window in participant_windows)
+            label_buffer.extend(window.label_index for window in participant_windows)
             self.participant_summaries.append(participant_summary.to_dict())
             aggregate_reasons.update(participant_summary.discard_reasons)
 
+        self.labels = np.asarray(label_buffer, dtype=np.int64)
         label_counts = self.label_counts()
         total_candidate_windows = sum(
             report["candidate_windows"] for report in self.participant_summaries
@@ -161,9 +162,10 @@ class WindowedSleepDataset(Dataset[WindowSample]):
     def __getitem__(self, index: int) -> WindowSample:
         metadata = self.samples[index]
         window = self._signals[metadata.participant_index][
-            metadata.input_start_index : metadata.input_end_index
+            :,
+            metadata.input_start_index : metadata.input_end_index,
         ]
-        signal_tensor = torch.from_numpy(window.T.copy())
+        signal_tensor = torch.from_numpy(window)
         target_start_idx = metadata.target_start_index - metadata.input_start_index
         target_end_idx = metadata.target_end_index - metadata.input_start_index
 
@@ -178,9 +180,12 @@ class WindowedSleepDataset(Dataset[WindowSample]):
         """Return the class distribution of retained target windows."""
 
         names = tuple(label_names) if label_names is not None else self.label_names
-        counts = Counter(self.labels)
+        counts = np.bincount(self.labels, minlength=len(names)) if len(self.labels) else np.zeros(
+            len(names),
+            dtype=np.int64,
+        )
         return {
-            label_name: int(counts.get(index, 0))
+            label_name: int(counts[index])
             for index, label_name in enumerate(names)
         }
 
@@ -312,8 +317,6 @@ def _generate_windows_for_participant(
         windows.append(
             WindowMetadata(
                 participant_index=participant_index,
-                participant_id=participant_id,
-                source_path=str(source_path),
                 input_start_index=input_start_index,
                 input_end_index=input_end_index,
                 target_start_index=target_start_index,

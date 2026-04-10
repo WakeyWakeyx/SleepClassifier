@@ -48,10 +48,18 @@ def discover_participant_files(dataset_dir: Path) -> list[Path]:
     return files
 
 
-def load_participant_file(file_path: Path) -> ParticipantData:
+def load_participant_file(
+    file_path: Path,
+    data_config: DataConfig | None = None,
+) -> ParticipantData:
     """Load a single participant CSV into a dataframe."""
 
-    frame = pd.read_csv(file_path, low_memory=False)
+    read_csv_kwargs: dict[str, Any] = {"low_memory": False}
+    if data_config is not None:
+        required_columns = set(_participant_csv_columns(data_config))
+        read_csv_kwargs["usecols"] = lambda column_name: column_name in required_columns
+
+    frame = pd.read_csv(file_path, **read_csv_kwargs)
     return ParticipantData(
         participant_id=file_path.stem,
         source_path=file_path,
@@ -59,12 +67,15 @@ def load_participant_file(file_path: Path) -> ParticipantData:
     )
 
 
-def load_participant_files(file_paths: Sequence[Path]) -> list[ParticipantData]:
+def load_participant_files(
+    file_paths: Sequence[Path],
+    data_config: DataConfig | None = None,
+) -> list[ParticipantData]:
     """Load multiple participant CSV files with progress reporting."""
 
     participants: list[ParticipantData] = []
     for file_path in tqdm(file_paths, desc="Loading participants", unit="file"):
-        participants.append(load_participant_file(file_path))
+        participants.append(load_participant_file(file_path, data_config=data_config))
     return participants
 
 
@@ -242,3 +253,13 @@ def _compute_split_counts(
             counts[index] += 1
 
     return int(counts[0]), int(counts[1]), int(counts[2])
+
+
+def _participant_csv_columns(data_config: DataConfig) -> list[str]:
+    """Return the minimal set of CSV columns required by the pipeline."""
+
+    return [
+        data_config.timestamp_column,
+        *data_config.feature_columns,
+        data_config.target_column,
+    ]

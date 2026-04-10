@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 from dataclasses import asdict
 from pathlib import Path
@@ -23,6 +24,7 @@ from src.data.data_loading import (
     split_participant_files,
 )
 from src.data.preprocessing import (
+    NormalizationStats,
     apply_normalization,
     clean_participant_frame,
     compute_normalization_stats,
@@ -127,18 +129,6 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
         split_name="train",
         logger=logger,
     )
-    val_participants = _load_and_clean_participants(
-        participant_split.val_files,
-        config,
-        split_name="validation",
-        logger=logger,
-    )
-    test_participants = _load_and_clean_participants(
-        participant_split.test_files,
-        config,
-        split_name="test",
-        logger=logger,
-    )
 
     normalization_stats = compute_normalization_stats(
         train_participants,
@@ -152,31 +142,29 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
         normalization_stats,
         config.data.feature_columns,
     )
-    val_participants = apply_normalization(
-        val_participants,
-        normalization_stats,
-        config.data.feature_columns,
-    )
-    test_participants = apply_normalization(
-        test_participants,
-        normalization_stats,
-        config.data.feature_columns,
-    )
-
-    train_dataset = WindowedSleepDataset(
+    train_dataset = _build_windowed_dataset(
         train_participants,
-        config.data,
-        config.label_to_index,
+        data_config=config.data,
+        label_to_index=config.label_to_index,
+        split_name="train",
+        logger=logger,
     )
-    val_dataset = WindowedSleepDataset(
-        val_participants,
-        config.data,
-        config.label_to_index,
+    train_participants.clear()
+    gc.collect()
+
+    val_dataset = _load_normalize_and_window_split(
+        file_paths=participant_split.val_files,
+        config=config,
+        split_name="validation",
+        logger=logger,
+        normalization_stats=normalization_stats,
     )
-    test_dataset = WindowedSleepDataset(
-        test_participants,
-        config.data,
-        config.label_to_index,
+    test_dataset = _load_normalize_and_window_split(
+        file_paths=participant_split.test_files,
+        config=config,
+        split_name="test",
+        logger=logger,
+        normalization_stats=normalization_stats,
     )
     _validate_dataset_sizes(train_dataset, val_dataset, test_dataset)
 
@@ -525,12 +513,62 @@ def _load_and_clean_participants(
     """Load raw CSV files and apply participant-level cleaning."""
 
     logger.info("Loading %s participants...", split_name)
-    raw_participants = load_participant_files(file_paths)
+    raw_participants = load_participant_files(file_paths, data_config=config.data)
     cleaned_participants = [
         clean_participant_frame(participant, config.data) for participant in raw_participants
     ]
     logger.info("Loaded and cleaned %d %s participants.", len(cleaned_participants), split_name)
     return cleaned_participants
+
+
+def _load_normalize_and_window_split(
+    file_paths: Sequence[Path],
+    config: ProjectConfig,
+    split_name: str,
+    logger: logging.Logger,
+    normalization_stats: NormalizationStats,
+) -> WindowedSleepDataset:
+    """Load one split, normalize it with train stats, and build its window dataset."""
+
+    participants = _load_and_clean_participants(
+        file_paths=file_paths,
+        config=config,
+        split_name=split_name,
+        logger=logger,
+    )
+    participants = apply_normalization(
+        participants,
+        normalization_stats,
+        config.data.feature_columns,
+    )
+    dataset = _build_windowed_dataset(
+        participants,
+        data_config=config.data,
+        label_to_index=config.label_to_index,
+        split_name=split_name,
+        logger=logger,
+    )
+    participants.clear()
+    gc.collect()
+    return dataset
+
+
+def _build_windowed_dataset(
+    participants: Sequence[ParticipantData],
+    data_config: DataConfig,
+    label_to_index: dict[str, int],
+    split_name: str,
+    logger: logging.Logger,
+) -> WindowedSleepDataset:
+    """Build a compact windowed dataset and log its retained sample count."""
+
+    dataset = WindowedSleepDataset(participants, data_config, label_to_index)
+    logger.info(
+        "Materialized %d retained %s windows from compact participant arrays.",
+        len(dataset),
+        split_name,
+    )
+    return dataset
 
 
 def _prepare_output_directories(config: ProjectConfig) -> None:
@@ -579,7 +617,7 @@ def _compute_class_weights(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute train-only class weights according to the configured weighting mode."""
 
-    if not labels:
+    if len(labels) == 0:
         raise ValueError("Train dataset produced no labels for class weight computation.")
 
     counts = torch.bincount(torch.tensor(labels, dtype=torch.long), minlength=num_classes)
