@@ -21,6 +21,7 @@ def compute_classification_metrics(
     targets: Sequence[int],
     predictions: Sequence[int],
     label_names: Sequence[str],
+    minority_labels: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Compute aggregate and per-class classification metrics."""
 
@@ -93,6 +94,17 @@ def compute_classification_metrics(
         }
         for index, label_name in enumerate(label_names)
     }
+    minority_label_set = set(minority_labels or ())
+    minority_scores = [
+        per_class[label_name]["f1"]
+        for label_name in label_names
+        if label_name in minority_label_set
+    ]
+    minority_macro_f1 = (
+        float(sum(minority_scores) / len(minority_scores))
+        if minority_scores
+        else float(macro_f1)
+    )
 
     return {
         "accuracy": float(accuracy),
@@ -100,6 +112,7 @@ def compute_classification_metrics(
         "macro_precision": float(macro_precision),
         "macro_recall": float(macro_recall),
         "macro_f1": float(macro_f1),
+        "minority_macro_f1": minority_macro_f1,
         "weighted_precision": float(weighted_precision),
         "weighted_recall": float(weighted_recall),
         "weighted_f1": float(weighted_f1),
@@ -248,6 +261,7 @@ def save_summary_metrics_csv(metrics: dict[str, Any], output_path: Path) -> None
                 "macro_precision": metrics["macro_precision"],
                 "macro_recall": metrics["macro_recall"],
                 "macro_f1": metrics["macro_f1"],
+                "minority_macro_f1": metrics["minority_macro_f1"],
                 "weighted_precision": metrics["weighted_precision"],
                 "weighted_recall": metrics["weighted_recall"],
                 "weighted_f1": metrics["weighted_f1"],
@@ -263,9 +277,45 @@ def save_summary_metrics_csv(metrics: dict[str, Any], output_path: Path) -> None
             "macro_precision",
             "macro_recall",
             "macro_f1",
+            "minority_macro_f1",
             "weighted_precision",
             "weighted_recall",
             "weighted_f1",
+        ],
+    )
+
+
+def save_distribution_shift_csv(
+    distribution_shift: dict[str, dict[str, float]],
+    output_path: Path,
+) -> None:
+    """Persist prediction-vs-target distribution deltas for quick inspection."""
+
+    rows = []
+    for label_name, stats in distribution_shift.items():
+        rows.append(
+            {
+                "label": label_name,
+                "target_count": stats["target_count"],
+                "prediction_count": stats["prediction_count"],
+                "count_delta": stats["count_delta"],
+                "target_fraction": stats["target_fraction"],
+                "prediction_fraction": stats["prediction_fraction"],
+                "fraction_delta": stats["fraction_delta"],
+            }
+        )
+
+    save_csv_rows(
+        rows=rows,
+        path=output_path,
+        fieldnames=[
+            "label",
+            "target_count",
+            "prediction_count",
+            "count_delta",
+            "target_fraction",
+            "prediction_fraction",
+            "fraction_delta",
         ],
     )
 
