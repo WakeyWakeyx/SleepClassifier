@@ -21,7 +21,7 @@ from src.utils import (
 )
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def evaluate_model(
     model: nn.Module,
     dataloader: DataLoader,

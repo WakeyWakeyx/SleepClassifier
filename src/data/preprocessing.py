@@ -120,11 +120,14 @@ def compute_normalization_stats(
     total_rows = 0
 
     for participant in participants:
-        values = participant.frame.loc[:, feature_columns].to_numpy(dtype=np.float64)
+        values = participant.frame.loc[:, feature_columns].to_numpy(
+            dtype=np.float32,
+            copy=False,
+        )
         if values.size == 0:
             continue
-        sums += values.sum(axis=0)
-        squared_sums += np.square(values).sum(axis=0)
+        sums += values.sum(axis=0, dtype=np.float64)
+        squared_sums += np.square(values, dtype=np.float64).sum(axis=0, dtype=np.float64)
         total_rows += values.shape[0]
 
     if total_rows == 0:
@@ -147,22 +150,26 @@ def apply_normalization(
     stats: NormalizationStats,
     feature_columns: Sequence[str],
 ) -> list[ParticipantData]:
-    """Apply precomputed normalization statistics to a participant collection."""
+    """Apply precomputed normalization statistics in place."""
 
-    normalized_participants: list[ParticipantData] = []
-    for participant in participants:
-        frame = participant.frame.copy()
-        for column_name in feature_columns:
-            frame[column_name] = (
-                frame[column_name].astype(np.float32) - stats.means[column_name]
-            ) / stats.stds[column_name]
-        normalized_participants.append(
-            ParticipantData(
-                participant_id=participant.participant_id,
-                source_path=participant.source_path,
-                frame=frame,
-            )
+    normalized_participants = list(participants)
+    means = np.asarray(
+        [stats.means[column_name] for column_name in feature_columns],
+        dtype=np.float32,
+    )
+    stds = np.asarray(
+        [stats.stds[column_name] for column_name in feature_columns],
+        dtype=np.float32,
+    )
+
+    for participant in normalized_participants:
+        values = participant.frame.loc[:, feature_columns].to_numpy(
+            dtype=np.float32,
+            copy=False,
         )
+        normalized_values = ((values - means) / stds).astype(np.float32, copy=False)
+        participant.frame.loc[:, feature_columns] = normalized_values
+
     return normalized_participants
 
 
