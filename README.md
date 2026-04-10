@@ -66,13 +66,14 @@ Each CSV is treated as one participant/session file. The loader recursively scan
 - `IBI`
 - `Sleep_Stage`
 
-By default the project looks for data in:
+If `DREAMT_DATASET_DIR` is not set, the project resolves the dataset directory in this order:
 
 ```text
-dataset/data_64Hz
+1. dataset/data_64Hz
+2. D:\Dreamt\data_64Hz
 ```
 
-Override that with:
+Override either fallback with:
 
 ```powershell
 $env:DREAMT_DATASET_DIR = "C:\path\to\data_64Hz"
@@ -196,17 +197,21 @@ The recommended default is `cnn_bilstm_target_pool`.
 
 - a Conv1d feature extractor for local temporal structure
 - a BiLSTM over the reduced temporal sequence
-- target-region-only pooling over BiLSTM outputs
+- explicit target-region pooling over BiLSTM outputs
+- optional pooled context summaries outside the target region
 - a classifier head for `W`, `N1`, `N2`, `N3`, and `R`
 
-Target-aware pooling is explicit:
+`cnn_bilstm` is kept as a backward-compatible alias of the same CNN+BiLSTM implementation.
+
+Target-aware modeling is explicit:
 
 - target start and end indices are tracked through the pipeline
 - target bounds are downsampled through the CNN encoder
-- final pooling happens only over target-region outputs
-- context helps feature formation, but the final pooled representation still comes from the target region only
+- the model appends a target-indicator channel and a normalized relative-position channel to the raw inputs
+- pooled summaries can be taken from the target region and, optionally, from the surrounding context region
+- context still never changes the assigned target label
 
-The pooling module uses mean, max, and learned attention inside the target region to make better use of the center segment while still benefiting from surrounding temporal context.
+The pooling module uses mean, max, and learned attention statistics. When context pooling is enabled, the classifier sees target features, context features, and their difference, which makes the center segment easier to distinguish from surrounding transition context.
 
 ## Imbalance Handling and Ablations
 
@@ -217,6 +222,8 @@ Important knobs:
 - `LOSS_NAME`
 - `USE_WEIGHTED_SAMPLER`
 - `CLASS_WEIGHTING`
+- `SAMPLER_WEIGHTING`
+- `CLASS_BALANCE_BETA`
 - `LABEL_SMOOTHING`
 - `focal_gamma`
 - `focal_reduction`
@@ -234,6 +241,7 @@ Supported class-weighting modes:
 - `none`
 - `inverse_frequency`
 - `sqrt_inverse_frequency`
+- `effective_number`
 
 Typical ablations are now straightforward:
 
@@ -259,9 +267,11 @@ The current defaults are intentionally more conservative than stacking multiple 
 - `LOSS_NAME = "weighted_cross_entropy"`
 - `USE_WEIGHTED_SAMPLER = False`
 - `CLASS_WEIGHTING = "sqrt_inverse_frequency"`
+- `SAMPLER_WEIGHTING = "inverse_frequency"`
+- `CLASS_BALANCE_BETA = 0.9999`
 - `LABEL_SMOOTHING = 0.0`
 
-Class weights are computed from TRAIN target windows only and saved to:
+Class-count and weighting diagnostics are computed from TRAIN target windows only and saved to:
 
 ```text
 outputs/class_weights.json
@@ -299,9 +309,21 @@ The training loop includes:
 - configurable dropout and weight decay
 - optional label smoothing for cross-entropy losses
 - optional `WeightedRandomSampler` for the training loader
+- optional CUDA AMP / mixed precision for both training and evaluation
+- optional `ReduceLROnPlateau` scheduling on validation macro F1
+- separate training and evaluation batch sizes
+- configurable validation artifact frequency
 - early stopping on validation macro F1
 - best checkpoint selection by validation macro F1
 - final test evaluation using the best checkpoint
+
+Runtime diagnostics now log:
+
+- current learning rate
+- epoch duration
+- training throughput in examples/second
+- CUDA peak memory when running on GPU
+- batch size, eval batch size, worker count, pin-memory, AMP, and TF32 settings
 
 If context windows are enabled, training logs include:
 
@@ -408,15 +430,21 @@ Edit `src/config.py` to change:
 - context window lengths
 - label purity and valid-label thresholds
 - ambiguous-window handling
-- model type and CNN/LSTM dimensions
+- model type, CNN/LSTM dimensions, and target/context fusion behavior
+- target indicator and relative-position input channels
 - dropout
-- batch size
+- batch size and evaluation batch size
 - learning rate
 - weight decay
-- weighted sampling
+- weighted sampling and sampler weighting mode
 - loss selection
-- class-weighting mode
+- class-weighting mode and `effective_number` weighting
+- class-balance beta
 - focal gamma, alpha, and reduction
+- AMP dtype
+- deterministic vs benchmarked CUDA behavior
+- TF32 usage
+- validation artifact frequency
 - early stopping patience
 
 ## Troubleshooting
@@ -437,9 +465,30 @@ Try a less aggressive combination:
 
 - disable `USE_WEIGHTED_SAMPLER`
 - use `CLASS_WEIGHTING = "sqrt_inverse_frequency"` instead of full inverse weighting
+- compare `CLASS_WEIGHTING = "effective_number"` against the frequency-based modes
+- keep `SAMPLER_WEIGHTING` and `CLASS_WEIGHTING` as separate ablations rather than assuming they should match
 - compare `weighted_cross_entropy` against `focal_loss`
 - check `prediction_minus_target_count` fields in the saved metrics artifacts
 
 ### A supervised class is missing from the TRAIN split
 
 The pipeline raises an error if any of `W/N1/N2/N3/R` has zero TRAIN target windows because class weights and sampling would be ill-defined.
+
+### CUDA and throughput checks
+
+When CUDA is active, `outputs/train.log` will show `Using device: cuda` plus the runtime settings for AMP, TF32, batch size, and pin-memory.
+
+Helpful checks:
+
+- run `python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu')"`
+- run `nvidia-smi` during training to confirm memory allocation and utilization
+
+### DataLoader workers on Windows
+
+The default `num_workers=0` is conservative on purpose. This project keeps large participant arrays in memory, and higher worker counts on Windows can duplicate that memory because worker processes are spawned instead of forked.
+
+If GPU utilization is low and system RAM is comfortable, you can still try:
+
+- increasing `EVAL_BATCH_SIZE`
+- enabling AMP if it was disabled
+- raising `num_workers` carefully and monitoring RAM usage
