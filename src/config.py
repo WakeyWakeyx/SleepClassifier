@@ -33,7 +33,7 @@ LABEL_PURITY_THRESHOLD = 0.80
 # Frequently tuned training/model defaults exposed as clear top-level knobs.
 MODEL_NAME = "cnn_bilstm_target_pool"
 DROPOUT = 0.40
-LOSS_NAME = "weighted_cross_entropy"
+LOSS_NAME = "balanced_softmax"
 LABEL_SMOOTHING = 0.0
 USE_WEIGHTED_SAMPLER = False
 CLASS_WEIGHTING = "sqrt_inverse_frequency"
@@ -152,6 +152,7 @@ class ModelConfig:
     num_classes: int = len(LABEL_NAMES)
     conv_channels: tuple[int, ...] = (64, 128, 192)
     kernel_sizes: tuple[int, ...] = (7, 5, 5)
+    conv_dilations: tuple[int, ...] = (1, 2, 4)
     dropout: float = DROPOUT
     classifier_hidden_dim: int = 128
     lstm_hidden_size: int = 128
@@ -160,6 +161,7 @@ class ModelConfig:
     use_target_indicator_channel: bool = USE_TARGET_INDICATOR_CHANNEL
     use_relative_position_channel: bool = USE_RELATIVE_POSITION_CHANNEL
     pool_context_region: bool = POOL_CONTEXT_REGION
+    separate_context_regions: bool = True
 
     @property
     def model_type(self) -> str:
@@ -266,12 +268,16 @@ def build_config() -> ProjectConfig:
         )
     if len(config.model.conv_channels) != len(config.model.kernel_sizes):
         raise ValueError("conv_channels and kernel_sizes must have the same length.")
+    if len(config.model.conv_channels) != len(config.model.conv_dilations):
+        raise ValueError("conv_channels and conv_dilations must have the same length.")
     if not config.model.conv_channels:
         raise ValueError("At least one convolutional stage is required.")
     if config.model.lstm_num_layers < 1:
         raise ValueError("lstm_num_layers must be at least 1.")
     if any(kernel_size < 3 or kernel_size % 2 == 0 for kernel_size in config.model.kernel_sizes):
         raise ValueError("kernel_sizes must be odd integers greater than or equal to 3.")
+    if any(dilation < 1 for dilation in config.model.conv_dilations):
+        raise ValueError("conv_dilations must be positive integers.")
     if not 0.0 <= config.model.dropout < 1.0:
         raise ValueError("model dropout must be in the interval [0, 1).")
     if not 0.0 <= config.model.lstm_dropout < 1.0:
@@ -297,12 +303,13 @@ def build_config() -> ProjectConfig:
     if config.training.loss_name not in {
         "cross_entropy",
         "weighted_cross_entropy",
+        "balanced_softmax",
         "focal_loss",
         "weighted_focal_loss",
     }:
         raise ValueError(
             "loss_name must be one of: cross_entropy, weighted_cross_entropy, "
-            "focal_loss, weighted_focal_loss."
+            "balanced_softmax, focal_loss, weighted_focal_loss."
         )
     if config.training.class_weighting_mode not in {
         "none",
