@@ -29,6 +29,8 @@ def evaluate_model(
     device: torch.device,
     label_names: Sequence[str],
     split_name: str,
+    amp_enabled: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
 ) -> dict[str, Any]:
     """Evaluate a model and return a rich metric dictionary."""
 
@@ -45,12 +47,17 @@ def evaluate_model(
         target_start_indices = batch["target_start_idx"].to(device, non_blocking=True)
         target_end_indices = batch["target_end_idx"].to(device, non_blocking=True)
 
-        logits = model(
-            inputs,
-            target_start_indices=target_start_indices,
-            target_end_indices=target_end_indices,
-        )
-        raw_loss = criterion(logits, targets)
+        with torch.autocast(
+            device_type=device.type,
+            dtype=amp_dtype,
+            enabled=amp_enabled,
+        ):
+            logits = model(
+                inputs,
+                target_start_indices=target_start_indices,
+                target_end_indices=target_end_indices,
+            )
+            raw_loss = criterion(logits, targets)
         if raw_loss.ndim > 0:
             loss = raw_loss.mean()
         elif getattr(criterion, "reduction", None) == "sum":
