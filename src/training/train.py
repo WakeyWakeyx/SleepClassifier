@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import math
 from dataclasses import asdict
 from pathlib import Path
 from time import perf_counter
@@ -13,7 +14,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 from torch.utils.data import DataLoader, Sampler, WeightedRandomSampler
 from tqdm.auto import tqdm
 
@@ -53,6 +54,7 @@ class FocalLoss(nn.Module):
         self,
         gamma: float = 2.0,
         alpha: torch.Tensor | None = None,
+        label_smoothing: float = 0.0,
         reduction: str = "mean",
     ) -> None:
         super().__init__()
@@ -60,6 +62,7 @@ class FocalLoss(nn.Module):
             raise ValueError("reduction must be 'mean', 'sum', or 'none'.")
 
         self.gamma = gamma
+        self.label_smoothing = label_smoothing
         self.reduction = reduction
         if alpha is not None:
             if alpha.ndim != 1:
@@ -76,7 +79,17 @@ class FocalLoss(nn.Module):
         target_log_probs = log_probs.gather(dim=1, index=targets.unsqueeze(1)).squeeze(1)
         target_probs = probs.gather(dim=1, index=targets.unsqueeze(1)).squeeze(1)
 
-        loss = -torch.pow(1.0 - target_probs, self.gamma) * target_log_probs
+        nll_loss = -target_log_probs
+        if self.label_smoothing > 0.0:
+            smooth_loss = -log_probs.mean(dim=1)
+            ce_loss = (
+                (1.0 - self.label_smoothing) * nll_loss
+                + self.label_smoothing * smooth_loss
+            )
+        else:
+            ce_loss = nll_loss
+
+        loss = torch.pow(1.0 - target_probs, self.gamma) * ce_loss
         if self.alpha is not None:
             loss = loss * self.alpha.gather(dim=0, index=targets)
 
@@ -115,11 +128,16 @@ class BalancedSoftmaxLoss(nn.Module):
         )
 
 
+class SamplerPlan(dict):
+    """Lightweight typed container for sampler metadata and reporting."""
+
+
 def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
     """Run data preparation, training, validation, and final test evaluation."""
 
     _prepare_output_directories(config)
     logger = build_logger(config.paths.log_path)
+    save_json(_checkpoint_config_payload(config), config.paths.config_snapshot_path)
     set_seed(
         config.training.seed,
         deterministic=config.training.deterministic,
@@ -130,20 +148,31 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
     amp_enabled = bool(config.training.use_amp and device.type == "cuda")
     amp_dtype = _resolve_amp_dtype(config.training.amp_dtype)
     evaluation_batch_size = config.training.eval_batch_size or config.training.batch_size
+    active_num_workers = config.training.num_workers
+    active_persistent_workers = (
+        config.training.persistent_workers and active_num_workers > 0
+    )
 
+    logger.info(
+        "Experiment | preset=%s | name=%s | group=%s | run_dir=%s",
+        config.experiment.preset_name,
+        config.experiment.name,
+        config.experiment.group_name,
+        config.paths.run_dir,
+    )
     logger.info("Using device: %s", device)
     logger.info("Dataset directory: %s", config.data.dataset_dir)
     logger.info(
         (
-            "Configured model=%s | loss=%s | weighted_sampler=%s | "
-            "class_weighting=%s | sampler_weighting=%s | label_smoothing=%.3f"
+            "Configured model=%s | loss=%s | sampler=%s | "
+            "class_weighting=%s | label_smoothing=%.3f | early_stopping=%s"
         ),
         config.model.model_name,
         config.training.loss_name,
-        config.training.use_weighted_sampler,
+        config.training.resolved_sampler_strategy,
         config.training.class_weighting_mode,
-        config.training.sampler_weighting_mode,
         config.training.label_smoothing,
+        config.training.early_stopping_metric,
     )
     logger.info(
         (
@@ -153,9 +182,9 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
         ),
         config.training.batch_size,
         evaluation_batch_size,
-        config.training.num_workers,
+        active_num_workers,
         device.type == "cuda",
-        config.training.persistent_workers and config.training.num_workers > 0,
+        active_persistent_workers,
         config.training.prefetch_factor,
         amp_enabled,
         config.training.amp_dtype,
@@ -295,20 +324,24 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
         counts=class_counts,
         mode=config.training.class_weighting_mode,
         beta=config.training.class_balance_beta,
+        max_weight_ratio=config.training.loss_max_weight_ratio,
     )
     sampler_class_weights = _compute_balancing_weights(
         counts=class_counts,
-        mode=config.training.sampler_weighting_mode,
+        mode=config.training.resolved_sampler_strategy,
         beta=config.training.class_balance_beta,
+        max_weight_ratio=config.training.sampler_max_weight_ratio,
     )
     _save_class_weight_report(
         counts=class_counts,
         label_names=config.data.label_names,
         loss_weight_mode=config.training.class_weighting_mode,
         loss_weights=loss_class_weights,
-        sampler_weight_mode=config.training.sampler_weighting_mode,
+        sampler_weight_mode=config.training.resolved_sampler_strategy,
         sampler_weights=sampler_class_weights,
         beta=config.training.class_balance_beta,
+        loss_max_weight_ratio=config.training.loss_max_weight_ratio,
+        sampler_max_weight_ratio=config.training.sampler_max_weight_ratio,
         output_path=config.paths.class_weights_path,
     )
     logger.info(
@@ -330,55 +363,66 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
                 digits=0,
             ),
         )
-    if config.training.use_weighted_sampler:
+    sampler_plan = _build_weighted_sampler_plan(
+        labels=train_dataset.labels,
+        class_counts=class_counts,
+        class_weights=sampler_class_weights,
+        config=config,
+    )
+    save_json(
+        {key: value for key, value in sampler_plan.items() if key != "sampler"},
+        config.paths.sampler_report_path,
+    )
+    if config.training.sampler_enabled:
         logger.info(
             "Sampler weights | mode=%s | %s",
-            config.training.sampler_weighting_mode,
+            config.training.resolved_sampler_strategy,
             _format_named_values(
                 _weights_to_named_dict(sampler_class_weights, config.data.label_names),
                 digits=4,
             ),
         )
-
-    train_sampler = (
-        _build_weighted_sampler(
-            labels=train_dataset.labels,
-            class_weights=sampler_class_weights,
-            seed=config.training.seed,
+        logger.info(
+            "Sampler class probabilities | %s",
+            _format_named_values(sampler_plan["class_probabilities"], digits=4),
         )
-        if config.training.use_weighted_sampler
-        else None
-    )
+        logger.info(
+            "Sampler expected class counts per epoch | %s | replacement=%s",
+            _format_named_values(sampler_plan["expected_class_counts"], digits=1),
+            sampler_plan["replacement"],
+        )
+
+    train_sampler = sampler_plan["sampler"]
 
     train_loader = _build_dataloader(
         dataset=train_dataset,
         batch_size=config.training.batch_size,
-        num_workers=config.training.num_workers,
+        num_workers=active_num_workers,
         shuffle=train_sampler is None,
         seed=config.training.seed,
         pin_memory=device.type == "cuda",
-        persistent_workers=config.training.persistent_workers,
+        persistent_workers=active_persistent_workers,
         prefetch_factor=config.training.prefetch_factor,
         sampler=train_sampler,
     )
     val_loader = _build_dataloader(
         dataset=val_dataset,
         batch_size=evaluation_batch_size,
-        num_workers=config.training.num_workers,
+        num_workers=active_num_workers,
         shuffle=False,
         seed=config.training.seed,
         pin_memory=device.type == "cuda",
-        persistent_workers=config.training.persistent_workers,
+        persistent_workers=active_persistent_workers,
         prefetch_factor=config.training.prefetch_factor,
     )
     test_loader = _build_dataloader(
         dataset=test_dataset,
         batch_size=evaluation_batch_size,
-        num_workers=config.training.num_workers,
+        num_workers=active_num_workers,
         shuffle=False,
         seed=config.training.seed,
         pin_memory=device.type == "cuda",
-        persistent_workers=config.training.persistent_workers,
+        persistent_workers=active_persistent_workers,
         prefetch_factor=config.training.prefetch_factor,
     )
 
@@ -402,19 +446,21 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
     scheduler = _build_scheduler(optimizer=optimizer, config=config)
     scaler = _build_grad_scaler(amp_enabled=amp_enabled)
     logger.info("Training criterion: %s", loss_description)
-    if scheduler is not None:
-        logger.info(
-            "LR scheduler: %s(factor=%.3f, patience=%d, min_lr=%.2e)",
-            config.training.scheduler_name,
-            config.training.scheduler_factor,
-            config.training.scheduler_patience,
-            config.training.scheduler_min_lr,
+    if config.training.loss_name == "balanced_softmax" and config.training.sampler_enabled:
+        logger.warning(
+            "Balanced softmax is paired with a sampler; prefer bounded sampling and watch stability."
         )
+    if scheduler is not None:
+        logger.info("LR scheduler: %s", _describe_scheduler(config))
 
     history: list[dict[str, Any]] = []
-    best_val_macro_f1 = float("-inf")
+    best_metric_trackers = _initialize_best_metric_trackers()
+    monitored_metric_name = config.training.early_stopping_metric
+    best_monitored_metric = float("-inf")
     epochs_without_improvement = 0
     best_epoch = 0
+    best_epoch_metrics: dict[str, Any] = {}
+    collapse_state = _initialize_collapse_state(config.data.label_names)
 
     for epoch in range(1, config.training.max_epochs + 1):
         train_metrics = _train_one_epoch(
@@ -436,9 +482,20 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
             criterion=eval_criterion,
             device=device,
             label_names=config.data.label_names,
+            minority_labels=config.training.minority_labels,
             split_name="validation",
             amp_enabled=amp_enabled,
             amp_dtype=amp_dtype,
+        )
+        collapse_state, collapse_alerts = _update_collapse_state(
+            collapse_state=collapse_state,
+            val_metrics=val_metrics,
+            config=config,
+        )
+        _update_best_metric_trackers(
+            best_metric_trackers=best_metric_trackers,
+            epoch=epoch,
+            metrics=val_metrics,
         )
         if epoch % config.training.validation_artifact_frequency == 0:
             save_evaluation_artifacts(
@@ -457,7 +514,11 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
         )
         previous_lr = optimizer.param_groups[0]["lr"]
         if scheduler is not None:
-            scheduler.step(val_metrics["macro_f1"])
+            _step_scheduler(
+                scheduler=scheduler,
+                config=config,
+                monitored_metric=float(val_metrics[monitored_metric_name]),
+            )
         current_lr = optimizer.param_groups[0]["lr"]
 
         epoch_record = {
@@ -465,6 +526,7 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
             "learning_rate": float(current_lr),
             "train_loss": train_metrics["loss"],
             "train": train_metrics,
+            "collapse_alerts": collapse_alerts,
             "validation": {
                 key: val_metrics[key]
                 for key in (
@@ -474,6 +536,7 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
                     "macro_precision",
                     "macro_recall",
                     "macro_f1",
+                    "minority_macro_f1",
                     "weighted_precision",
                     "weighted_recall",
                     "weighted_f1",
@@ -490,11 +553,14 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
         history.append(epoch_record)
         save_json(history, config.paths.training_history_path)
 
+        monitored_metric_value = float(val_metrics[monitored_metric_name])
+
         logger.info(
             (
                 "Epoch %d/%d | lr=%.2e | train_loss=%.4f | val_loss=%.4f | "
                 "val_acc=%.4f | val_bal_acc=%.4f | val_macro_f1=%.4f | "
-                "val_weighted_f1=%.4f | epoch_sec=%.1f | train_examples_per_sec=%.1f"
+                "val_minority_f1=%.4f | val_weighted_f1=%.4f | epoch_sec=%.1f | "
+                "train_examples_per_sec=%.1f"
             ),
             epoch,
             config.training.max_epochs,
@@ -504,9 +570,16 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
             val_metrics["accuracy"],
             val_metrics["balanced_accuracy"],
             val_metrics["macro_f1"],
+            val_metrics["minority_macro_f1"],
             val_metrics["weighted_f1"],
             train_metrics["duration_seconds"],
             train_metrics["examples_per_second"],
+        )
+        logger.info(
+            "Train runtime | data_wait_sec=%.2f | compute_sec=%.2f | workers=%d",
+            train_metrics["data_wait_seconds"],
+            train_metrics["compute_seconds"],
+            train_metrics["num_workers"],
         )
         logger.info(
             "Validation per-class F1 | %s",
@@ -532,22 +605,32 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
                 previous_lr,
                 current_lr,
             )
+        for alert in collapse_alerts:
+            logger.warning("Stage collapse alert | %s", alert)
 
-        if val_metrics["macro_f1"] > (best_val_macro_f1 + config.training.min_delta):
-            best_val_macro_f1 = float(val_metrics["macro_f1"])
+        if monitored_metric_value > (best_monitored_metric + config.training.min_delta):
+            best_monitored_metric = monitored_metric_value
             best_epoch = epoch
             epochs_without_improvement = 0
-            logger.info("New best checkpoint identified at epoch %d.", epoch)
+            best_epoch_metrics = dict(val_metrics)
+            logger.info(
+                "New best checkpoint identified at epoch %d using %s=%.4f.",
+                epoch,
+                monitored_metric_name,
+                monitored_metric_value,
+            )
         else:
             epochs_without_improvement += 1
             logger.info(
-                "Validation macro F1 did not improve for %d epoch(s).",
+                "Validation %s did not improve for %d epoch(s).",
+                monitored_metric_name,
                 epochs_without_improvement,
             )
 
         checkpoint_state = {
             "epoch": epoch,
-            "best_val_macro_f1": best_val_macro_f1,
+            "best_monitored_metric": best_monitored_metric,
+            "best_epoch_by_early_stopping_metric": best_epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
@@ -568,6 +651,7 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
                 label_name: float(sampler_class_weights[index].item())
                 for index, label_name in enumerate(config.data.label_names)
             },
+            "best_metric_trackers": best_metric_trackers,
         }
         save_checkpoint(checkpoint_state, config.paths.latest_checkpoint_path)
 
@@ -587,9 +671,10 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
 
     load_checkpoint(config.paths.best_checkpoint_path, model=model, device=device)
     logger.info(
-        "Loaded best checkpoint from epoch %d with validation macro F1 %.4f.",
+        "Loaded best checkpoint from epoch %d with validation %s %.4f.",
         best_epoch,
-        best_val_macro_f1,
+        monitored_metric_name,
+        best_monitored_metric,
     )
 
     test_metrics = evaluate_model(
@@ -598,6 +683,7 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
         criterion=eval_criterion,
         device=device,
         label_names=config.data.label_names,
+        minority_labels=config.training.minority_labels,
         split_name="test",
         amp_enabled=amp_enabled,
         amp_dtype=amp_dtype,
@@ -612,12 +698,13 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
     logger.info(
         (
             "Test results | loss=%.4f | accuracy=%.4f | balanced_accuracy=%.4f | "
-            "macro_f1=%.4f | weighted_f1=%.4f"
+            "macro_f1=%.4f | minority_macro_f1=%.4f | weighted_f1=%.4f"
         ),
         test_metrics["loss"],
         test_metrics["accuracy"],
         test_metrics["balanced_accuracy"],
         test_metrics["macro_f1"],
+        test_metrics["minority_macro_f1"],
         test_metrics["weighted_f1"],
     )
     logger.info(
@@ -634,6 +721,14 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
     )
 
     summary = {
+        "experiment": {
+            "preset_name": config.experiment.preset_name,
+            "name": config.experiment.name,
+            "group_name": config.experiment.group_name,
+            "run_id": config.experiment.run_id,
+            "notes": config.experiment.notes,
+            "output_dir": str(config.paths.run_dir),
+        },
         "device": str(device),
         "dataset_dir": str(config.data.dataset_dir),
         "model": {
@@ -647,14 +742,10 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
         "training_runtime": {
             "batch_size": config.training.batch_size,
             "eval_batch_size": evaluation_batch_size,
-            "num_workers": config.training.num_workers,
+            "num_workers": active_num_workers,
             "pin_memory": device.type == "cuda",
-            "persistent_workers": (
-                config.training.persistent_workers if config.training.num_workers > 0 else False
-            ),
-            "prefetch_factor": (
-                config.training.prefetch_factor if config.training.num_workers > 0 else None
-            ),
+            "persistent_workers": active_persistent_workers,
+            "prefetch_factor": config.training.prefetch_factor if active_num_workers > 0 else None,
             "use_amp": amp_enabled,
             "amp_dtype": config.training.amp_dtype if amp_enabled else None,
             "scheduler_name": config.training.scheduler_name,
@@ -663,12 +754,16 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
             "allow_tf32": config.training.allow_tf32,
             "loss_name": config.training.loss_name,
             "class_weighting_mode": config.training.class_weighting_mode,
-            "sampler_weighting_mode": config.training.sampler_weighting_mode,
-            "use_weighted_sampler": config.training.use_weighted_sampler,
+            "sampler_strategy": config.training.resolved_sampler_strategy,
+            "use_weighted_sampler": config.training.sampler_enabled,
+            "early_stopping_metric": config.training.early_stopping_metric,
         },
         "sequence_definition": _build_windowing_config_summary(config.data),
         "best_epoch": best_epoch,
-        "best_val_macro_f1": best_val_macro_f1,
+        "best_monitored_metric_name": monitored_metric_name,
+        "best_monitored_metric": best_monitored_metric,
+        "best_epoch_validation_metrics": best_epoch_metrics,
+        "best_epochs_by_metric": best_metric_trackers,
         "train_class_counts": {
             label_name: int(class_counts[index].item())
             for index, label_name in enumerate(config.data.label_names)
@@ -680,6 +775,11 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
         "train_sampler_weights": {
             label_name: float(sampler_class_weights[index].item())
             for index, label_name in enumerate(config.data.label_names)
+        },
+        "sampler_plan": {
+            key: value
+            for key, value in sampler_plan.items()
+            if key != "sampler"
         },
         "test_metrics": test_metrics,
     }
@@ -799,9 +899,11 @@ def _prepare_output_directories(config: ProjectConfig) -> None:
     """Create all output directories used by the pipeline."""
 
     ensure_directory(config.paths.output_dir)
+    ensure_directory(config.paths.group_dir)
     ensure_directory(config.paths.validation_dir)
     ensure_directory(config.paths.validation_epochs_dir)
     ensure_directory(config.paths.test_dir)
+    ensure_directory(config.paths.checkpoints_dir)
     ensure_directory(config.paths.latest_checkpoint_path.parent)
     ensure_directory(config.paths.best_checkpoint_path.parent)
 
@@ -869,6 +971,7 @@ def _compute_balancing_weights(
     counts: torch.Tensor,
     mode: str,
     beta: float,
+    max_weight_ratio: float | None = None,
 ) -> torch.Tensor:
     """Compute normalized class-balancing weights for loss or sampling."""
 
@@ -878,6 +981,8 @@ def _compute_balancing_weights(
 
     if mode == "inverse_frequency":
         weights = counts.sum() / (counts * float(counts.numel()))
+    elif mode == "capped_inverse_frequency":
+        weights = counts.sum() / (counts * float(counts.numel()))
     elif mode == "sqrt_inverse_frequency":
         weights = torch.sqrt(counts.sum() / (counts * float(counts.numel())))
     elif mode == "effective_number":
@@ -886,6 +991,9 @@ def _compute_balancing_weights(
     else:
         raise ValueError(f"Unsupported balancing mode: {mode}")
 
+    if max_weight_ratio is not None:
+        min_weight = weights.min().clamp_min(1e-12)
+        weights = weights.clamp(max=min_weight * max_weight_ratio)
     return (weights / weights.mean()).to(dtype=torch.float32)
 
 
@@ -897,6 +1005,8 @@ def _save_class_weight_report(
     sampler_weight_mode: str,
     sampler_weights: torch.Tensor,
     beta: float,
+    loss_max_weight_ratio: float | None,
+    sampler_max_weight_ratio: float | None,
     output_path: Path,
 ) -> None:
     """Persist the train-only class-count and weighting diagnostics."""
@@ -907,6 +1017,8 @@ def _save_class_weight_report(
             "class_balance_beta": beta,
             "class_weighting_mode": loss_weight_mode,
             "sampler_weighting_mode": sampler_weight_mode,
+            "loss_max_weight_ratio": loss_max_weight_ratio,
+            "sampler_max_weight_ratio": sampler_max_weight_ratio,
             "counts": {
                 label_names[index]: int(counts[index].item())
                 for index in range(len(label_names))
@@ -938,33 +1050,139 @@ def _save_class_weight_report(
     )
 
 
-def _build_weighted_sampler(
+def _build_weighted_sampler_plan(
     labels: Sequence[int],
+    class_counts: torch.Tensor,
     class_weights: torch.Tensor,
-    seed: int,
-) -> WeightedRandomSampler:
-    """Create a train-only weighted sampler using train-window class weights."""
+    config: ProjectConfig,
+) -> SamplerPlan:
+    """Build a weighted sampler plus a report of its effective class probabilities."""
+
+    if not config.training.sampler_enabled:
+        return SamplerPlan(
+            sampler=None,
+            class_probabilities={
+                label_name: (
+                    float(class_counts[index].item()) / float(class_counts.sum().item())
+                )
+                for index, label_name in enumerate(config.data.label_names)
+            },
+            expected_class_counts={
+                label_name: float(class_counts[index].item())
+                for index, label_name in enumerate(config.data.label_names)
+            },
+            replacement=False,
+            num_samples=len(labels),
+        )
+
+    class_counts_float = class_counts.float()
+    class_mass = class_counts_float * class_weights.float()
+    class_probabilities = class_mass / class_mass.sum().clamp_min(1e-12)
+    class_probabilities = _apply_probability_constraints(
+        probabilities=class_probabilities,
+        label_names=config.data.label_names,
+        floors=config.training.sampler_probability_floors,
+        caps=config.training.sampler_probability_caps,
+    )
 
     label_tensor = torch.tensor(labels, dtype=torch.long)
-    sample_weights = class_weights[label_tensor].double()
+    per_sample_weights = (
+        class_probabilities[label_tensor] / class_counts_float[label_tensor].clamp_min(1.0)
+    )
+    per_sample_weights = (per_sample_weights / per_sample_weights.mean()).double()
+    num_samples = max(
+        1,
+        int(math.ceil(len(labels) * config.training.sampler_num_samples_multiplier)),
+    )
+    if not config.training.sampler_replacement:
+        num_samples = min(num_samples, len(labels))
+
     generator = torch.Generator()
-    generator.manual_seed(seed)
-    return WeightedRandomSampler(
-        weights=sample_weights,
-        num_samples=len(labels),
-        replacement=True,
+    generator.manual_seed(config.training.seed)
+    sampler = WeightedRandomSampler(
+        weights=per_sample_weights,
+        num_samples=num_samples,
+        replacement=config.training.sampler_replacement,
         generator=generator,
     )
+    return SamplerPlan(
+        sampler=sampler,
+        class_probabilities={
+            label_name: float(class_probabilities[index].item())
+            for index, label_name in enumerate(config.data.label_names)
+        },
+        expected_class_counts={
+            label_name: float(class_probabilities[index].item() * num_samples)
+            for index, label_name in enumerate(config.data.label_names)
+        },
+        replacement=config.training.sampler_replacement,
+        num_samples=num_samples,
+    )
+
+
+def _apply_probability_constraints(
+    probabilities: torch.Tensor,
+    label_names: Sequence[str],
+    floors: dict[str, float],
+    caps: dict[str, float],
+) -> torch.Tensor:
+    """Apply optional per-class probability floors and caps while preserving sum=1."""
+
+    adjusted = probabilities.clone().float()
+    floor_values = torch.tensor(
+        [floors.get(label_name, 0.0) for label_name in label_names],
+        dtype=torch.float32,
+    )
+    cap_values = torch.tensor(
+        [caps.get(label_name, 1.0) for label_name in label_names],
+        dtype=torch.float32,
+    )
+    base = adjusted.clone()
+
+    for _ in range(8):
+        adjusted = adjusted / adjusted.sum().clamp_min(1e-12)
+        below_mask = adjusted < floor_values
+        above_mask = adjusted > cap_values
+        fixed_mask = below_mask | above_mask
+        if not torch.any(fixed_mask):
+            return adjusted
+
+        adjusted = adjusted.clone()
+        adjusted = torch.where(below_mask, floor_values, adjusted)
+        adjusted = torch.where(above_mask, cap_values, adjusted)
+        remaining_mass = 1.0 - adjusted[fixed_mask].sum()
+        if remaining_mass < -1e-6:
+            raise ValueError("Sampler probability floors and caps are inconsistent.")
+
+        free_mask = ~fixed_mask
+        if torch.any(free_mask):
+            free_base = base[free_mask]
+            if float(free_base.sum().item()) <= 0.0:
+                adjusted[free_mask] = remaining_mass / float(free_mask.sum().item())
+            else:
+                adjusted[free_mask] = remaining_mass * (
+                    free_base / free_base.sum().clamp_min(1e-12)
+                )
+        elif remaining_mass > 1e-6:
+            raise ValueError("Sampler probability caps leave unused probability mass.")
+
+    return adjusted / adjusted.sum().clamp_min(1e-12)
 
 
 def _build_scheduler(
     optimizer: torch.optim.Optimizer,
     config: ProjectConfig,
-) -> ReduceLROnPlateau | None:
+) -> ReduceLROnPlateau | CosineAnnealingLR | None:
     """Construct the configured learning-rate scheduler."""
 
     if config.training.scheduler_name == "none":
         return None
+    if config.training.scheduler_name == "cosine_annealing":
+        return CosineAnnealingLR(
+            optimizer=optimizer,
+            T_max=config.training.scheduler_t_max,
+            eta_min=config.training.scheduler_eta_min,
+        )
 
     return ReduceLROnPlateau(
         optimizer=optimizer,
@@ -973,6 +1191,132 @@ def _build_scheduler(
         patience=config.training.scheduler_patience,
         min_lr=config.training.scheduler_min_lr,
     )
+
+
+def _describe_scheduler(config: ProjectConfig) -> str:
+    """Render the configured scheduler in a compact log-friendly form."""
+
+    if config.training.scheduler_name == "cosine_annealing":
+        return (
+            "cosine_annealing("
+            f"T_max={config.training.scheduler_t_max}, "
+            f"eta_min={config.training.scheduler_eta_min:.2e})"
+        )
+    return (
+        "reduce_on_plateau("
+        f"factor={config.training.scheduler_factor:.3f}, "
+        f"patience={config.training.scheduler_patience}, "
+        f"min_lr={config.training.scheduler_min_lr:.2e})"
+    )
+
+
+def _step_scheduler(
+    scheduler: ReduceLROnPlateau | CosineAnnealingLR,
+    config: ProjectConfig,
+    monitored_metric: float,
+) -> None:
+    """Advance the configured scheduler with the appropriate step signature."""
+
+    if config.training.scheduler_name == "reduce_on_plateau":
+        scheduler.step(monitored_metric)
+        return
+    scheduler.step()
+
+
+def _temper_loss_weights_for_sampler(
+    weights: torch.Tensor,
+    sampler_enabled: bool,
+    power: float,
+) -> torch.Tensor:
+    """Soften loss-side reweighting when a sampler is already rebalancing batches."""
+
+    if not sampler_enabled:
+        return weights.float()
+    tempered = torch.pow(weights.float().clamp_min(1e-12), power)
+    return tempered / tempered.mean().clamp_min(1e-12)
+
+
+def _initialize_best_metric_trackers() -> dict[str, dict[str, float | int]]:
+    """Create running best-epoch trackers for the key validation metrics."""
+
+    return {
+        "macro_f1": {"epoch": 0, "value": float("-inf")},
+        "balanced_accuracy": {"epoch": 0, "value": float("-inf")},
+        "minority_macro_f1": {"epoch": 0, "value": float("-inf")},
+    }
+
+
+def _update_best_metric_trackers(
+    best_metric_trackers: dict[str, dict[str, float | int]],
+    epoch: int,
+    metrics: dict[str, Any],
+) -> None:
+    """Update tracked best epochs for the main validation metrics."""
+
+    for metric_name in ("macro_f1", "balanced_accuracy", "minority_macro_f1"):
+        metric_value = float(metrics[metric_name])
+        if metric_value > float(best_metric_trackers[metric_name]["value"]):
+            best_metric_trackers[metric_name] = {
+                "epoch": epoch,
+                "value": metric_value,
+            }
+
+
+def _initialize_collapse_state(
+    label_names: Sequence[str],
+) -> dict[str, dict[str, int]]:
+    """Create per-class streak counters used for collapse alerts."""
+
+    return {
+        label_name: {
+            "low_recall_streak": 0,
+            "near_zero_prediction_streak": 0,
+        }
+        for label_name in label_names
+    }
+
+
+def _update_collapse_state(
+    collapse_state: dict[str, dict[str, int]],
+    val_metrics: dict[str, Any],
+    config: ProjectConfig,
+) -> tuple[dict[str, dict[str, int]], list[str]]:
+    """Track persistent recall collapse or prediction collapse across epochs."""
+
+    alerts: list[str] = []
+    for label_name, metrics in val_metrics["per_class"].items():
+        low_recall = metrics["recall"] < config.training.collapse_recall_threshold
+        near_zero_prediction = (
+            metrics["predicted_count"] <= config.training.collapse_predicted_count_threshold
+            or metrics["predicted_fraction"]
+            <= config.training.collapse_predicted_fraction_threshold
+        )
+        collapse_state[label_name]["low_recall_streak"] = (
+            collapse_state[label_name]["low_recall_streak"] + 1 if low_recall else 0
+        )
+        collapse_state[label_name]["near_zero_prediction_streak"] = (
+            collapse_state[label_name]["near_zero_prediction_streak"] + 1
+            if near_zero_prediction
+            else 0
+        )
+
+        if (
+            collapse_state[label_name]["low_recall_streak"]
+            >= config.training.collapse_patience_epochs
+        ):
+            alerts.append(
+                f"{label_name} recall stayed below {config.training.collapse_recall_threshold:.3f} "
+                f"for {collapse_state[label_name]['low_recall_streak']} epochs"
+            )
+        if (
+            collapse_state[label_name]["near_zero_prediction_streak"]
+            >= config.training.collapse_patience_epochs
+        ):
+            alerts.append(
+                f"{label_name} predicted count stayed near zero for "
+                f"{collapse_state[label_name]['near_zero_prediction_streak']} epochs"
+            )
+    return collapse_state, alerts
 
 
 def _build_grad_scaler(amp_enabled: bool) -> Any:
@@ -1004,6 +1348,12 @@ def _build_training_criterion(
 ) -> tuple[nn.Module, str]:
     """Create the configured training loss."""
 
+    effective_loss_weights = _temper_loss_weights_for_sampler(
+        weights=class_weights,
+        sampler_enabled=config.training.sampler_enabled,
+        power=config.training.loss_weight_power_when_sampling,
+    )
+
     if config.training.loss_name == "cross_entropy":
         return (
             nn.CrossEntropyLoss(label_smoothing=config.training.label_smoothing),
@@ -1013,13 +1363,14 @@ def _build_training_criterion(
     if config.training.loss_name == "weighted_cross_entropy":
         return (
             nn.CrossEntropyLoss(
-                weight=class_weights.to(device),
+                weight=effective_loss_weights.to(device),
                 label_smoothing=config.training.label_smoothing,
             ),
             (
                 "weighted_cross_entropy("
                 f"label_smoothing={config.training.label_smoothing:.3f}, "
-                f"class_weights=train_window_{config.training.class_weighting_mode})"
+                f"class_weights=train_window_{config.training.class_weighting_mode}, "
+                f"tempered_for_sampler={config.training.sampler_enabled})"
             ),
         )
 
@@ -1042,13 +1393,28 @@ def _build_training_criterion(
         focal_alpha = torch.tensor(config.training.focal_alpha, dtype=torch.float32, device=device)
         focal_alpha_description = "config_focal_alpha"
     elif config.training.loss_name == "weighted_focal_loss":
-        focal_alpha = class_weights.to(device)
-        focal_alpha_description = f"train_window_{config.training.class_weighting_mode}"
+        focal_alpha = effective_loss_weights.to(device)
+        focal_alpha_description = (
+            f"train_window_{config.training.class_weighting_mode}_tempered"
+        )
+    elif config.training.loss_name == "class_balanced_focal_loss":
+        focal_alpha = _temper_loss_weights_for_sampler(
+            weights=_compute_balancing_weights(
+                counts=class_counts,
+                mode="effective_number",
+                beta=config.training.class_balance_beta,
+                max_weight_ratio=config.training.loss_max_weight_ratio,
+            ),
+            sampler_enabled=config.training.sampler_enabled,
+            power=config.training.loss_weight_power_when_sampling,
+        ).to(device)
+        focal_alpha_description = "effective_number_tempered"
 
     return (
         FocalLoss(
             gamma=config.training.focal_gamma,
             alpha=focal_alpha,
+            label_smoothing=config.training.label_smoothing,
             reduction=config.training.focal_reduction,
         ),
         (
@@ -1056,7 +1422,7 @@ def _build_training_criterion(
             f"gamma={config.training.focal_gamma:.3f}, "
             f"alpha={focal_alpha_description}, "
             f"reduction={config.training.focal_reduction}, "
-            f"label_smoothing_applied={False})"
+            f"label_smoothing={config.training.label_smoothing:.3f})"
         ),
     )
 
@@ -1080,11 +1446,17 @@ def _train_one_epoch(
     total_loss = 0.0
     total_examples = 0
     epoch_start_time = perf_counter()
+    data_wait_seconds = 0.0
+    compute_seconds = 0.0
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
     progress = tqdm(dataloader, desc=f"Epoch {epoch}/{max_epochs}", leave=False)
+    batch_fetch_start = perf_counter()
     for batch in progress:
+        batch_ready_time = perf_counter()
+        data_wait_seconds += batch_ready_time - batch_fetch_start
+        compute_start_time = perf_counter()
         inputs = batch["inputs"].to(device, non_blocking=True)
         targets = batch["target"].to(device, non_blocking=True)
         target_start_indices = batch["target_start_idx"].to(device, non_blocking=True)
@@ -1130,7 +1502,9 @@ def _train_one_epoch(
 
         total_loss += float(display_loss.item()) * batch_size
         total_examples += batch_size
+        compute_seconds += perf_counter() - compute_start_time
         progress.set_postfix(loss=f"{display_loss.item():.4f}")
+        batch_fetch_start = perf_counter()
 
     if total_examples == 0:
         raise ValueError("No training samples were available for this epoch.")
@@ -1148,6 +1522,9 @@ def _train_one_epoch(
         "num_examples": float(total_examples),
         "duration_seconds": duration_seconds,
         "examples_per_second": total_examples / max(duration_seconds, 1e-8),
+        "data_wait_seconds": data_wait_seconds,
+        "compute_seconds": compute_seconds,
+        "num_workers": int(dataloader.num_workers),
         "max_cuda_memory_mb": max_cuda_memory_mb,
         "max_cuda_memory_fraction": max_cuda_memory_fraction,
     }
@@ -1181,13 +1558,14 @@ def _log_window_summary(
         logger.info(
             (
                 "%s sequence definition | target_length=%d left_context=%d "
-                "right_context=%d total_input_length=%d"
+                "right_context=%d total_input_length=%d | label_strategy=%s"
             ),
             split_name,
             sequence_definition["target_window_length"],
             sequence_definition["left_context"],
             sequence_definition["right_context"],
             sequence_definition["total_input_length"],
+            sequence_definition["target_label_strategy"],
         )
 
     logger.info(
@@ -1220,6 +1598,26 @@ def _log_window_summary(
             split_name,
             _format_named_values(dataset.summary["discard_reasons"], digits=0),
         )
+    if dataset.summary.get("actual_purity_discards_by_class"):
+        logger.info(
+            "%s purity discards by class | %s",
+            split_name,
+            _format_named_values(dataset.summary["actual_purity_discards_by_class"], digits=0),
+        )
+        logger.info(
+            "%s purity failure rates by class | %s",
+            split_name,
+            _format_named_values(dataset.summary["purity_threshold_failure_rates_by_class"], digits=3),
+        )
+        purity_relative_loss = dataset.summary.get("minority_purity_relative_loss", {})
+        if purity_relative_loss:
+            logger.info(
+                "%s purity pressure vs overall | N1=%.2fx | N3=%.2fx | R=%.2fx",
+                split_name,
+                purity_relative_loss.get("N1", {}).get("relative_to_overall", 0.0),
+                purity_relative_loss.get("N3", {}).get("relative_to_overall", 0.0),
+                purity_relative_loss.get("R", {}).get("relative_to_overall", 0.0),
+            )
 
 
 def _log_sequence_configuration(
@@ -1231,7 +1629,8 @@ def _log_sequence_configuration(
     logger.info(
         (
             "Sequence windowing | target_length=%d | left_context=%d | "
-            "right_context=%d | total_input_length=%d | step=%d | use_context_windows=%s"
+            "right_context=%d | total_input_length=%d | step=%d | use_context_windows=%s | "
+            "label_strategy=%s | purity_threshold=%.2f | center_label_span=%d"
         ),
         data_config.target_window_length,
         data_config.effective_left_context,
@@ -1239,16 +1638,23 @@ def _log_sequence_configuration(
         data_config.input_window_length,
         data_config.step,
         data_config.use_context_windows,
+        data_config.target_label_strategy,
+        data_config.label_purity_threshold,
+        data_config.center_label_span,
     )
 
 
-def _build_windowing_config_summary(data_config: DataConfig) -> dict[str, int | float | bool]:
+def _build_windowing_config_summary(
+    data_config: DataConfig,
+) -> dict[str, int | float | bool | str]:
     """Serialize the sequence windowing configuration saved with artifacts."""
 
     return {
         "target_window_length": data_config.target_window_length,
         "step": data_config.step,
         "use_context_windows": data_config.use_context_windows,
+        "target_label_strategy": data_config.target_label_strategy,
+        "center_label_span": data_config.center_label_span,
         "configured_left_context": data_config.left_context,
         "configured_right_context": data_config.right_context,
         "left_context": data_config.effective_left_context,
@@ -1334,6 +1740,7 @@ def _checkpoint_config_payload(config: ProjectConfig) -> dict[str, Any]:
 
     payload = asdict(config)
     payload["data"]["dataset_dir"] = str(config.data.dataset_dir)
+    payload["experiment"]["output_root"] = str(config.experiment.output_root)
     payload["paths"] = {
         key: str(value)
         for key, value in asdict(config.paths).items()
