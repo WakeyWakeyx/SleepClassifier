@@ -37,7 +37,25 @@ LOSS_NAME = "weighted_cross_entropy"
 LABEL_SMOOTHING = 0.0
 USE_WEIGHTED_SAMPLER = False
 CLASS_WEIGHTING = "sqrt_inverse_frequency"
+SAMPLER_WEIGHTING = "inverse_frequency"
+CLASS_BALANCE_BETA = 0.9999
 FOCAL_REDUCTION = "mean"
+USE_TARGET_INDICATOR_CHANNEL = True
+USE_RELATIVE_POSITION_CHANNEL = True
+POOL_CONTEXT_REGION = True
+EVAL_BATCH_SIZE = 256
+PERSISTENT_WORKERS = True
+PREFETCH_FACTOR = 2
+USE_AMP = True
+AMP_DTYPE = "float16"
+DETERMINISTIC = False
+CUDNN_BENCHMARK = True
+ALLOW_TF32 = True
+SCHEDULER_NAME = "reduce_on_plateau"
+SCHEDULER_FACTOR = 0.5
+SCHEDULER_PATIENCE = 2
+SCHEDULER_MIN_LR = 1e-5
+VALIDATION_ARTIFACT_FREQUENCY = 1
 
 
 def _default_dataset_dir() -> Path:
@@ -46,6 +64,11 @@ def _default_dataset_dir() -> Path:
     env_value = os.getenv("DREAMT_DATASET_DIR")
     if env_value:
         return Path(env_value)
+
+    project_local_dataset = PROJECT_ROOT / "dataset" / "data_64Hz"
+    if project_local_dataset.exists():
+        return project_local_dataset
+
     return Path(r"D:\Dreamt\data_64Hz")
 
 
@@ -134,6 +157,9 @@ class ModelConfig:
     lstm_hidden_size: int = 128
     lstm_num_layers: int = 1
     lstm_dropout: float = 0.20
+    use_target_indicator_channel: bool = USE_TARGET_INDICATOR_CHANNEL
+    use_relative_position_channel: bool = USE_RELATIVE_POSITION_CHANNEL
+    pool_context_region: bool = POOL_CONTEXT_REGION
 
     @property
     def model_type(self) -> str:
@@ -147,8 +173,11 @@ class TrainingConfig:
     """Configuration for optimization, logging, and runtime behavior."""
 
     seed: int = 42
-    batch_size: int = 256
+    batch_size: int = 128
+    eval_batch_size: int | None = EVAL_BATCH_SIZE
     num_workers: int = 0
+    persistent_workers: bool = PERSISTENT_WORKERS
+    prefetch_factor: int = PREFETCH_FACTOR
     max_epochs: int = 40
     learning_rate: float = 1e-3
     weight_decay: float = 5e-4
@@ -159,9 +188,21 @@ class TrainingConfig:
     loss_name: str = LOSS_NAME
     label_smoothing: float = LABEL_SMOOTHING
     class_weighting_mode: str = CLASS_WEIGHTING
+    sampler_weighting_mode: str = SAMPLER_WEIGHTING
+    class_balance_beta: float = CLASS_BALANCE_BETA
     focal_gamma: float = 2.0
     focal_reduction: str = FOCAL_REDUCTION
     focal_alpha: tuple[float, ...] | None = None
+    use_amp: bool = USE_AMP
+    amp_dtype: str = AMP_DTYPE
+    deterministic: bool = DETERMINISTIC
+    cudnn_benchmark: bool = CUDNN_BENCHMARK
+    allow_tf32: bool = ALLOW_TF32
+    scheduler_name: str = SCHEDULER_NAME
+    scheduler_factor: float = SCHEDULER_FACTOR
+    scheduler_patience: int = SCHEDULER_PATIENCE
+    scheduler_min_lr: float = SCHEDULER_MIN_LR
+    validation_artifact_frequency: int = VALIDATION_ARTIFACT_FREQUENCY
 
 
 @dataclass(slots=True, frozen=True)
@@ -267,10 +308,21 @@ def build_config() -> ProjectConfig:
         "none",
         "inverse_frequency",
         "sqrt_inverse_frequency",
+        "effective_number",
     }:
         raise ValueError(
             "class_weighting_mode must be 'none', 'inverse_frequency', "
-            "or 'sqrt_inverse_frequency'."
+            "'sqrt_inverse_frequency', or 'effective_number'."
+        )
+    if config.training.sampler_weighting_mode not in {
+        "none",
+        "inverse_frequency",
+        "sqrt_inverse_frequency",
+        "effective_number",
+    }:
+        raise ValueError(
+            "sampler_weighting_mode must be 'none', 'inverse_frequency', "
+            "'sqrt_inverse_frequency', or 'effective_number'."
         )
     if not 0.0 <= config.training.label_smoothing < 1.0:
         raise ValueError("label_smoothing must be in the interval [0, 1).")
@@ -278,6 +330,26 @@ def build_config() -> ProjectConfig:
         raise ValueError("focal_gamma must be non-negative.")
     if config.training.focal_reduction not in {"mean", "sum", "none"}:
         raise ValueError("focal_reduction must be 'mean', 'sum', or 'none'.")
+    if config.training.eval_batch_size is not None and config.training.eval_batch_size <= 0:
+        raise ValueError("eval_batch_size must be positive when provided.")
+    if config.training.num_workers < 0:
+        raise ValueError("num_workers must be greater than or equal to 0.")
+    if config.training.prefetch_factor <= 0:
+        raise ValueError("prefetch_factor must be positive.")
+    if config.training.amp_dtype not in {"float16", "bfloat16"}:
+        raise ValueError("amp_dtype must be 'float16' or 'bfloat16'.")
+    if config.training.scheduler_name not in {"none", "reduce_on_plateau"}:
+        raise ValueError("scheduler_name must be 'none' or 'reduce_on_plateau'.")
+    if not 0.0 < config.training.scheduler_factor < 1.0:
+        raise ValueError("scheduler_factor must be in the interval (0, 1).")
+    if config.training.scheduler_patience < 0:
+        raise ValueError("scheduler_patience must be non-negative.")
+    if config.training.scheduler_min_lr < 0.0:
+        raise ValueError("scheduler_min_lr must be non-negative.")
+    if not 0.0 <= config.training.class_balance_beta < 1.0:
+        raise ValueError("class_balance_beta must be in the interval [0, 1).")
+    if config.training.validation_artifact_frequency <= 0:
+        raise ValueError("validation_artifact_frequency must be positive.")
     if (
         config.training.focal_alpha is not None
         and len(config.training.focal_alpha) != config.model.num_classes
