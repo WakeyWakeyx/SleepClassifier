@@ -15,6 +15,7 @@ from src.utils import (
     ensure_directory,
     save_confusion_matrix_csv,
     save_confusion_matrix_figure,
+    save_distribution_shift_csv,
     save_json,
     save_per_class_metrics_csv,
     save_summary_metrics_csv,
@@ -28,6 +29,7 @@ def evaluate_model(
     criterion: nn.Module,
     device: torch.device,
     label_names: Sequence[str],
+    minority_labels: Sequence[str] | None,
     split_name: str,
     amp_enabled: bool = False,
     amp_dtype: torch.dtype = torch.float16,
@@ -80,6 +82,7 @@ def evaluate_model(
         targets=all_targets,
         predictions=all_predictions,
         label_names=label_names,
+        minority_labels=minority_labels,
     )
     metrics["loss"] = total_loss / total_examples
     metrics["num_examples"] = total_examples
@@ -102,6 +105,10 @@ def save_evaluation_artifacts(
     save_per_class_metrics_csv(
         metrics["per_class"],
         output_dir / f"{artifact_prefix}_per_class_metrics.csv",
+    )
+    save_distribution_shift_csv(
+        metrics["distribution_shift"],
+        output_dir / f"{artifact_prefix}_distribution_shift.csv",
     )
     save_confusion_matrix_csv(
         matrix=metrics["confusion_matrix"],
