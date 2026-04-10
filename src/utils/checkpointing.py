@@ -25,7 +25,14 @@ def load_checkpoint(
 ) -> dict[str, Any]:
     """Load a checkpoint into the provided model and optional optimizer."""
 
-    checkpoint = torch.load(path, map_location=device)
+    if not path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
+
+    try:
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(path, map_location=device)
+
     model.load_state_dict(checkpoint["model_state_dict"])
 
     if optimizer is not None and "optimizer_state_dict" in checkpoint:
