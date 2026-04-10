@@ -87,6 +87,34 @@ class FocalLoss(nn.Module):
         return loss.mean()
 
 
+class BalancedSoftmaxLoss(nn.Module):
+    """Balanced softmax loss that incorporates train-window class priors."""
+
+    def __init__(
+        self,
+        class_counts: torch.Tensor,
+        label_smoothing: float = 0.0,
+        reduction: str = "mean",
+    ) -> None:
+        super().__init__()
+        if reduction not in {"mean", "sum", "none"}:
+            raise ValueError("reduction must be 'mean', 'sum', or 'none'.")
+
+        self.label_smoothing = label_smoothing
+        self.reduction = reduction
+        log_class_counts = class_counts.float().clamp_min(1.0).log()
+        self.register_buffer("log_class_counts", log_class_counts)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        adjusted_logits = logits + self.log_class_counts.unsqueeze(0)
+        return F.cross_entropy(
+            adjusted_logits,
+            targets.long(),
+            reduction=self.reduction,
+            label_smoothing=self.label_smoothing,
+        )
+
+
 def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
     """Run data preparation, training, validation, and final test evaluation."""
 
@@ -291,6 +319,17 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
             digits=4,
         ),
     )
+    if config.training.loss_name == "balanced_softmax":
+        logger.info(
+            "Balanced softmax class counts | %s",
+            _format_named_values(
+                {
+                    label_name: int(class_counts[index].item())
+                    for index, label_name in enumerate(config.data.label_names)
+                },
+                digits=0,
+            ),
+        )
     if config.training.use_weighted_sampler:
         logger.info(
             "Sampler weights | mode=%s | %s",
@@ -350,6 +389,7 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
     )
     train_criterion, loss_description = _build_training_criterion(
         config=config,
+        class_counts=class_counts,
         class_weights=loss_class_weights,
         device=device,
     )
@@ -482,8 +522,9 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
         )
         if device.type == "cuda" and train_metrics["max_cuda_memory_mb"] is not None:
             logger.info(
-                "Training GPU peak memory | %.1f MiB",
+                "Training GPU peak memory | %.1f MiB (%.1f%% of device total)",
                 train_metrics["max_cuda_memory_mb"],
+                train_metrics["max_cuda_memory_fraction"] * 100.0,
             )
         if current_lr != previous_lr:
             logger.info(
@@ -597,9 +638,11 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
         "dataset_dir": str(config.data.dataset_dir),
         "model": {
             "name": config.model.model_name,
+            "conv_dilations": list(config.model.conv_dilations),
             "use_target_indicator_channel": config.model.use_target_indicator_channel,
             "use_relative_position_channel": config.model.use_relative_position_channel,
             "pool_context_region": config.model.pool_context_region,
+            "separate_context_regions": config.model.separate_context_regions,
         },
         "training_runtime": {
             "batch_size": config.training.batch_size,
@@ -653,11 +696,36 @@ def _load_and_clean_participants(
     """Load raw CSV files and apply participant-level cleaning."""
 
     logger.info("Loading %s participants...", split_name)
+    load_start_time = perf_counter()
     raw_participants = load_participant_files(file_paths, data_config=config.data)
-    cleaned_participants = [
-        clean_participant_frame(participant, config.data) for participant in raw_participants
-    ]
+    load_duration_seconds = perf_counter() - load_start_time
+
+    clean_start_time = perf_counter()
+    clean_durations_seconds: list[float] = []
+    cleaned_participants: list[ParticipantData] = []
+    for participant in raw_participants:
+        participant_clean_start_time = perf_counter()
+        cleaned_participants.append(clean_participant_frame(participant, config.data))
+        clean_durations_seconds.append(perf_counter() - participant_clean_start_time)
+
+    clean_duration_seconds = perf_counter() - clean_start_time
     logger.info("Loaded and cleaned %d %s participants.", len(cleaned_participants), split_name)
+    logger.info(
+        (
+            "%s data timings | load_participant_files_sec=%.2f | "
+            "clean_participant_frame_total_sec=%.2f | clean_participant_frame_mean_sec=%.2f | "
+            "clean_participant_frame_max_sec=%.2f"
+        ),
+        split_name.capitalize(),
+        load_duration_seconds,
+        clean_duration_seconds,
+        (
+            sum(clean_durations_seconds) / len(clean_durations_seconds)
+            if clean_durations_seconds
+            else 0.0
+        ),
+        max(clean_durations_seconds, default=0.0),
+    )
     return cleaned_participants
 
 
@@ -702,12 +770,28 @@ def _build_windowed_dataset(
 ) -> WindowedSleepDataset:
     """Build a compact windowed dataset and log its retained sample count."""
 
+    build_start_time = perf_counter()
     dataset = WindowedSleepDataset(participants, data_config, label_to_index)
+    build_duration_seconds = perf_counter() - build_start_time
+
+    label_count_start_time = perf_counter()
+    label_counts = dataset.label_counts()
+    label_count_duration_seconds = perf_counter() - label_count_start_time
     logger.info(
         "Materialized %d retained %s windows from compact participant arrays.",
         len(dataset),
         split_name,
     )
+    logger.info(
+        (
+            "%s dataset timings | WindowedSleepDataset_sec=%.2f | "
+            "label_counts_sec=%.4f"
+        ),
+        split_name.capitalize(),
+        build_duration_seconds,
+        label_count_duration_seconds,
+    )
+    logger.debug("%s label counts snapshot: %s", split_name.capitalize(), label_counts)
     return dataset
 
 
@@ -914,6 +998,7 @@ def _resolve_amp_dtype(amp_dtype: str) -> torch.dtype:
 
 def _build_training_criterion(
     config: ProjectConfig,
+    class_counts: torch.Tensor,
     class_weights: torch.Tensor,
     device: torch.device,
 ) -> tuple[nn.Module, str]:
@@ -935,6 +1020,19 @@ def _build_training_criterion(
                 "weighted_cross_entropy("
                 f"label_smoothing={config.training.label_smoothing:.3f}, "
                 f"class_weights=train_window_{config.training.class_weighting_mode})"
+            ),
+        )
+
+    if config.training.loss_name == "balanced_softmax":
+        return (
+            BalancedSoftmaxLoss(
+                class_counts=class_counts.to(device),
+                label_smoothing=config.training.label_smoothing,
+            ),
+            (
+                "balanced_softmax("
+                f"label_smoothing={config.training.label_smoothing:.3f}, "
+                "class_priors=train_window_counts)"
             ),
         )
 
@@ -1038,14 +1136,20 @@ def _train_one_epoch(
         raise ValueError("No training samples were available for this epoch.")
     duration_seconds = perf_counter() - epoch_start_time
     max_cuda_memory_mb = None
+    max_cuda_memory_fraction = None
     if device.type == "cuda":
         max_cuda_memory_mb = torch.cuda.max_memory_allocated(device) / (1024**2)
+        total_cuda_memory_bytes = torch.cuda.get_device_properties(device).total_memory
+        max_cuda_memory_fraction = (
+            torch.cuda.max_memory_allocated(device) / max(total_cuda_memory_bytes, 1)
+        )
     return {
         "loss": total_loss / total_examples,
         "num_examples": float(total_examples),
         "duration_seconds": duration_seconds,
         "examples_per_second": total_examples / max(duration_seconds, 1e-8),
         "max_cuda_memory_mb": max_cuda_memory_mb,
+        "max_cuda_memory_fraction": max_cuda_memory_fraction,
     }
 
 
@@ -1103,6 +1207,13 @@ def _log_window_summary(
         split_name,
         _format_named_values(dataset.summary["kept_class_counts"], digits=0),
     )
+    missing_class_participants = dataset.summary.get("participants_missing_each_class", {})
+    if missing_class_participants:
+        logger.info(
+            "%s participants missing each class | %s",
+            split_name,
+            _format_named_values(missing_class_participants, digits=0),
+        )
     if dataset.summary["discard_reasons"]:
         logger.info(
             "%s discard reasons | %s",
