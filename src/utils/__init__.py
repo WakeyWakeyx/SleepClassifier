@@ -5,6 +5,7 @@ from .metrics import (
     compute_classification_metrics,
     save_confusion_matrix_csv,
     save_confusion_matrix_figure,
+    save_distribution_shift_csv,
     save_per_class_metrics_csv,
     save_summary_metrics_csv,
 )
@@ -29,6 +30,7 @@ __all__ = [
     "save_checkpoint",
     "save_confusion_matrix_csv",
     "save_confusion_matrix_figure",
+    "save_distribution_shift_csv",
     "save_csv_rows",
     "save_json",
     "save_per_class_metrics_csv",
