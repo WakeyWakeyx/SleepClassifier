@@ -147,6 +147,15 @@ class WindowedSleepDataset(Dataset[WindowSample]):
             "ambiguous_windows_kept": int(total_ambiguous_windows_kept),
             "participants_with_no_kept_windows": int(participants_with_no_kept_windows),
             "kept_class_counts": label_counts,
+            "participants_missing_each_class": {
+                label_name: int(
+                    sum(
+                        report["kept_class_counts"].get(label_name, 0) == 0
+                        for report in self.participant_summaries
+                    )
+                )
+                for label_name in self.label_names
+            },
             "discard_reasons": {
                 reason: int(count)
                 for reason, count in sorted(aggregate_reasons.items())
@@ -160,6 +169,14 @@ class WindowedSleepDataset(Dataset[WindowSample]):
         return len(self.samples)
 
     def __getitem__(self, index: int) -> WindowSample:
+        return self._materialize_sample(index)
+
+    def __getitems__(self, indices: Sequence[int]) -> list[WindowSample]:
+        """Materialize a batch of samples when the DataLoader supports batched fetching."""
+
+        return [self._materialize_sample(index) for index in indices]
+
+    def _materialize_sample(self, index: int) -> WindowSample:
         metadata = self.samples[index]
         window = self._signals[metadata.participant_index][
             :,
