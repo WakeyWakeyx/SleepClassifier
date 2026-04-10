@@ -6,12 +6,14 @@ import gc
 import logging
 from dataclasses import asdict
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Sequence
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Sampler, WeightedRandomSampler
 from tqdm.auto import tqdm
 
@@ -90,21 +92,48 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
 
     _prepare_output_directories(config)
     logger = build_logger(config.paths.log_path)
-    set_seed(config.training.seed)
+    set_seed(
+        config.training.seed,
+        deterministic=config.training.deterministic,
+        cudnn_benchmark=config.training.cudnn_benchmark,
+        allow_tf32=config.training.allow_tf32,
+    )
     device = resolve_device()
+    amp_enabled = bool(config.training.use_amp and device.type == "cuda")
+    amp_dtype = _resolve_amp_dtype(config.training.amp_dtype)
+    evaluation_batch_size = config.training.eval_batch_size or config.training.batch_size
 
     logger.info("Using device: %s", device)
     logger.info("Dataset directory: %s", config.data.dataset_dir)
     logger.info(
         (
             "Configured model=%s | loss=%s | weighted_sampler=%s | "
-            "class_weighting=%s | label_smoothing=%.3f"
+            "class_weighting=%s | sampler_weighting=%s | label_smoothing=%.3f"
         ),
         config.model.model_name,
         config.training.loss_name,
         config.training.use_weighted_sampler,
         config.training.class_weighting_mode,
+        config.training.sampler_weighting_mode,
         config.training.label_smoothing,
+    )
+    logger.info(
+        (
+            "Runtime | batch_size=%d | eval_batch_size=%d | num_workers=%d | "
+            "pin_memory=%s | persistent_workers=%s | prefetch_factor=%d | "
+            "amp=%s (%s) | deterministic=%s | cudnn_benchmark=%s | allow_tf32=%s"
+        ),
+        config.training.batch_size,
+        evaluation_batch_size,
+        config.training.num_workers,
+        device.type == "cuda",
+        config.training.persistent_workers and config.training.num_workers > 0,
+        config.training.prefetch_factor,
+        amp_enabled,
+        config.training.amp_dtype,
+        config.training.deterministic,
+        config.training.cudnn_benchmark,
+        config.training.allow_tf32,
     )
     _log_sequence_configuration(logger, config.data)
 
@@ -229,29 +258,53 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
     _log_window_summary(logger, "Validation", val_dataset)
     _log_window_summary(logger, "Test", test_dataset)
 
-    class_counts, class_weights = _compute_class_weights(
+    class_counts = _compute_class_counts(
         labels=train_dataset.labels,
         num_classes=config.model.num_classes,
         label_names=config.data.label_names,
-        class_weighting_mode=config.training.class_weighting_mode,
+    )
+    loss_class_weights = _compute_balancing_weights(
+        counts=class_counts,
+        mode=config.training.class_weighting_mode,
+        beta=config.training.class_balance_beta,
+    )
+    sampler_class_weights = _compute_balancing_weights(
+        counts=class_counts,
+        mode=config.training.sampler_weighting_mode,
+        beta=config.training.class_balance_beta,
+    )
+    _save_class_weight_report(
+        counts=class_counts,
+        label_names=config.data.label_names,
+        loss_weight_mode=config.training.class_weighting_mode,
+        loss_weights=loss_class_weights,
+        sampler_weight_mode=config.training.sampler_weighting_mode,
+        sampler_weights=sampler_class_weights,
+        beta=config.training.class_balance_beta,
         output_path=config.paths.class_weights_path,
     )
     logger.info(
-        "Class weights computed from TRAIN target windows only | mode=%s | %s",
+        "Loss class weights | mode=%s | %s",
         config.training.class_weighting_mode,
         _format_named_values(
-            {
-                label_name: float(class_weights[index].item())
-                for index, label_name in enumerate(config.data.label_names)
-            },
+            _weights_to_named_dict(loss_class_weights, config.data.label_names),
             digits=4,
         ),
     )
+    if config.training.use_weighted_sampler:
+        logger.info(
+            "Sampler weights | mode=%s | %s",
+            config.training.sampler_weighting_mode,
+            _format_named_values(
+                _weights_to_named_dict(sampler_class_weights, config.data.label_names),
+                digits=4,
+            ),
+        )
 
     train_sampler = (
         _build_weighted_sampler(
             labels=train_dataset.labels,
-            class_weights=class_weights,
+            class_weights=sampler_class_weights,
             seed=config.training.seed,
         )
         if config.training.use_weighted_sampler
@@ -265,29 +318,39 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
         shuffle=train_sampler is None,
         seed=config.training.seed,
         pin_memory=device.type == "cuda",
+        persistent_workers=config.training.persistent_workers,
+        prefetch_factor=config.training.prefetch_factor,
         sampler=train_sampler,
     )
     val_loader = _build_dataloader(
         dataset=val_dataset,
-        batch_size=config.training.batch_size,
+        batch_size=evaluation_batch_size,
         num_workers=config.training.num_workers,
         shuffle=False,
         seed=config.training.seed,
         pin_memory=device.type == "cuda",
+        persistent_workers=config.training.persistent_workers,
+        prefetch_factor=config.training.prefetch_factor,
     )
     test_loader = _build_dataloader(
         dataset=test_dataset,
-        batch_size=config.training.batch_size,
+        batch_size=evaluation_batch_size,
         num_workers=config.training.num_workers,
         shuffle=False,
         seed=config.training.seed,
         pin_memory=device.type == "cuda",
+        persistent_workers=config.training.persistent_workers,
+        prefetch_factor=config.training.prefetch_factor,
     )
 
     model = build_model(config.model).to(device)
+    logger.info(
+        "Model parameters | trainable=%d",
+        _count_trainable_parameters(model),
+    )
     train_criterion, loss_description = _build_training_criterion(
         config=config,
-        class_weights=class_weights,
+        class_weights=loss_class_weights,
         device=device,
     )
     eval_criterion = nn.CrossEntropyLoss()
@@ -296,7 +359,17 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
         lr=config.training.learning_rate,
         weight_decay=config.training.weight_decay,
     )
+    scheduler = _build_scheduler(optimizer=optimizer, config=config)
+    scaler = _build_grad_scaler(amp_enabled=amp_enabled)
     logger.info("Training criterion: %s", loss_description)
+    if scheduler is not None:
+        logger.info(
+            "LR scheduler: %s(factor=%.3f, patience=%d, min_lr=%.2e)",
+            config.training.scheduler_name,
+            config.training.scheduler_factor,
+            config.training.scheduler_patience,
+            config.training.scheduler_min_lr,
+        )
 
     history: list[dict[str, Any]] = []
     best_val_macro_f1 = float("-inf")
@@ -304,7 +377,7 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
     best_epoch = 0
 
     for epoch in range(1, config.training.max_epochs + 1):
-        train_loss = _train_one_epoch(
+        train_metrics = _train_one_epoch(
             model=model,
             dataloader=train_loader,
             optimizer=optimizer,
@@ -313,6 +386,9 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
             epoch=epoch,
             max_epochs=config.training.max_epochs,
             gradient_clip_norm=config.training.gradient_clip_norm,
+            scaler=scaler,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
         )
         val_metrics = evaluate_model(
             model=model,
@@ -321,14 +397,17 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
             device=device,
             label_names=config.data.label_names,
             split_name="validation",
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
         )
-        save_evaluation_artifacts(
-            metrics=val_metrics,
-            label_names=config.data.label_names,
-            output_dir=config.paths.validation_epochs_dir,
-            artifact_prefix=f"validation_epoch_{epoch:03d}",
-            title=f"Validation Confusion Matrix (Epoch {epoch})",
-        )
+        if epoch % config.training.validation_artifact_frequency == 0:
+            save_evaluation_artifacts(
+                metrics=val_metrics,
+                label_names=config.data.label_names,
+                output_dir=config.paths.validation_epochs_dir,
+                artifact_prefix=f"validation_epoch_{epoch:03d}",
+                title=f"Validation Confusion Matrix (Epoch {epoch})",
+            )
         save_evaluation_artifacts(
             metrics=val_metrics,
             label_names=config.data.label_names,
@@ -336,10 +415,16 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
             artifact_prefix="validation_latest",
             title=f"Validation Confusion Matrix (Epoch {epoch})",
         )
+        previous_lr = optimizer.param_groups[0]["lr"]
+        if scheduler is not None:
+            scheduler.step(val_metrics["macro_f1"])
+        current_lr = optimizer.param_groups[0]["lr"]
 
         epoch_record = {
             "epoch": epoch,
-            "train_loss": train_loss,
+            "learning_rate": float(current_lr),
+            "train_loss": train_metrics["loss"],
+            "train": train_metrics,
             "validation": {
                 key: val_metrics[key]
                 for key in (
@@ -367,17 +452,21 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
 
         logger.info(
             (
-                "Epoch %d/%d | train_loss=%.4f | val_loss=%.4f | val_acc=%.4f | "
-                "val_bal_acc=%.4f | val_macro_f1=%.4f | val_weighted_f1=%.4f"
+                "Epoch %d/%d | lr=%.2e | train_loss=%.4f | val_loss=%.4f | "
+                "val_acc=%.4f | val_bal_acc=%.4f | val_macro_f1=%.4f | "
+                "val_weighted_f1=%.4f | epoch_sec=%.1f | train_examples_per_sec=%.1f"
             ),
             epoch,
             config.training.max_epochs,
-            train_loss,
+            current_lr,
+            train_metrics["loss"],
             val_metrics["loss"],
             val_metrics["accuracy"],
             val_metrics["balanced_accuracy"],
             val_metrics["macro_f1"],
             val_metrics["weighted_f1"],
+            train_metrics["duration_seconds"],
+            train_metrics["examples_per_second"],
         )
         logger.info(
             "Validation per-class F1 | %s",
@@ -391,6 +480,17 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
             "Validation prediction minus target | %s",
             _format_distribution_shift(val_metrics["distribution_shift"]),
         )
+        if device.type == "cuda" and train_metrics["max_cuda_memory_mb"] is not None:
+            logger.info(
+                "Training GPU peak memory | %.1f MiB",
+                train_metrics["max_cuda_memory_mb"],
+            )
+        if current_lr != previous_lr:
+            logger.info(
+                "Scheduler adjusted learning rate from %.2e to %.2e.",
+                previous_lr,
+                current_lr,
+            )
 
         if val_metrics["macro_f1"] > (best_val_macro_f1 + config.training.min_delta):
             best_val_macro_f1 = float(val_metrics["macro_f1"])
@@ -409,6 +509,8 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
             "best_val_macro_f1": best_val_macro_f1,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+            "scaler_state_dict": scaler.state_dict() if amp_enabled else None,
             "label_names": list(config.data.label_names),
             "feature_columns": list(config.data.feature_columns),
             "normalization_stats": normalization_stats.to_dict(),
@@ -418,7 +520,11 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
                 for index, label_name in enumerate(config.data.label_names)
             },
             "train_class_weights": {
-                label_name: float(class_weights[index].item())
+                label_name: float(loss_class_weights[index].item())
+                for index, label_name in enumerate(config.data.label_names)
+            },
+            "train_sampler_weights": {
+                label_name: float(sampler_class_weights[index].item())
                 for index, label_name in enumerate(config.data.label_names)
             },
         }
@@ -452,6 +558,8 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
         device=device,
         label_names=config.data.label_names,
         split_name="test",
+        amp_enabled=amp_enabled,
+        amp_dtype=amp_dtype,
     )
     save_evaluation_artifacts(
         metrics=test_metrics,
@@ -487,6 +595,34 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
     summary = {
         "device": str(device),
         "dataset_dir": str(config.data.dataset_dir),
+        "model": {
+            "name": config.model.model_name,
+            "use_target_indicator_channel": config.model.use_target_indicator_channel,
+            "use_relative_position_channel": config.model.use_relative_position_channel,
+            "pool_context_region": config.model.pool_context_region,
+        },
+        "training_runtime": {
+            "batch_size": config.training.batch_size,
+            "eval_batch_size": evaluation_batch_size,
+            "num_workers": config.training.num_workers,
+            "pin_memory": device.type == "cuda",
+            "persistent_workers": (
+                config.training.persistent_workers if config.training.num_workers > 0 else False
+            ),
+            "prefetch_factor": (
+                config.training.prefetch_factor if config.training.num_workers > 0 else None
+            ),
+            "use_amp": amp_enabled,
+            "amp_dtype": config.training.amp_dtype if amp_enabled else None,
+            "scheduler_name": config.training.scheduler_name,
+            "deterministic": config.training.deterministic,
+            "cudnn_benchmark": config.training.cudnn_benchmark,
+            "allow_tf32": config.training.allow_tf32,
+            "loss_name": config.training.loss_name,
+            "class_weighting_mode": config.training.class_weighting_mode,
+            "sampler_weighting_mode": config.training.sampler_weighting_mode,
+            "use_weighted_sampler": config.training.use_weighted_sampler,
+        },
         "sequence_definition": _build_windowing_config_summary(config.data),
         "best_epoch": best_epoch,
         "best_val_macro_f1": best_val_macro_f1,
@@ -495,7 +631,11 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
             for index, label_name in enumerate(config.data.label_names)
         },
         "train_class_weights": {
-            label_name: float(class_weights[index].item())
+            label_name: float(loss_class_weights[index].item())
+            for index, label_name in enumerate(config.data.label_names)
+        },
+        "train_sampler_weights": {
+            label_name: float(sampler_class_weights[index].item())
             for index, label_name in enumerate(config.data.label_names)
         },
         "test_metrics": test_metrics,
@@ -589,6 +729,8 @@ def _build_dataloader(
     shuffle: bool,
     seed: int,
     pin_memory: bool,
+    persistent_workers: bool,
+    prefetch_factor: int,
     sampler: Sampler[int] | None = None,
 ) -> DataLoader:
     """Construct a DataLoader with deterministic worker seeding."""
@@ -596,26 +738,31 @@ def _build_dataloader(
     generator = torch.Generator()
     generator.manual_seed(seed)
 
+    dataloader_kwargs: dict[str, Any] = {
+        "dataset": dataset,
+        "batch_size": batch_size,
+        "shuffle": shuffle if sampler is None else False,
+        "sampler": sampler,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "worker_init_fn": seed_worker if num_workers > 0 else None,
+        "generator": generator,
+    }
+    if num_workers > 0:
+        dataloader_kwargs["persistent_workers"] = persistent_workers
+        dataloader_kwargs["prefetch_factor"] = prefetch_factor
+
     return DataLoader(
-        dataset=dataset,
-        batch_size=batch_size,
-        shuffle=shuffle if sampler is None else False,
-        sampler=sampler,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        worker_init_fn=seed_worker if num_workers > 0 else None,
-        generator=generator,
+        **dataloader_kwargs,
     )
 
 
-def _compute_class_weights(
+def _compute_class_counts(
     labels: Sequence[int],
     num_classes: int,
     label_names: Sequence[str],
-    class_weighting_mode: str,
-    output_path: Path,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute train-only class weights according to the configured weighting mode."""
+) -> torch.Tensor:
+    """Count retained train windows per class and fail fast on missing classes."""
 
     if len(labels) == 0:
         raise ValueError("Train dataset produced no labels for class weight computation.")
@@ -631,34 +778,80 @@ def _compute_class_weights(
             "At least one supervised class has zero train windows: "
             + ", ".join(zero_classes)
         )
+    return counts
 
-    if class_weighting_mode == "inverse_frequency":
-        total = counts.sum().float()
-        weights = total / (counts.float() * float(num_classes))
-        weights = weights / weights.mean()
-    elif class_weighting_mode == "sqrt_inverse_frequency":
-        total = counts.sum().float()
-        weights = torch.sqrt(total / (counts.float() * float(num_classes)))
-        weights = weights / weights.mean()
+
+def _compute_balancing_weights(
+    counts: torch.Tensor,
+    mode: str,
+    beta: float,
+) -> torch.Tensor:
+    """Compute normalized class-balancing weights for loss or sampling."""
+
+    counts = counts.float()
+    if mode == "none":
+        return torch.ones_like(counts, dtype=torch.float32)
+
+    if mode == "inverse_frequency":
+        weights = counts.sum() / (counts * float(counts.numel()))
+    elif mode == "sqrt_inverse_frequency":
+        weights = torch.sqrt(counts.sum() / (counts * float(counts.numel())))
+    elif mode == "effective_number":
+        effective_num = 1.0 - torch.pow(torch.full_like(counts, beta), counts)
+        weights = (1.0 - beta) / effective_num.clamp_min(1e-12)
     else:
-        weights = torch.ones(num_classes, dtype=torch.float32)
+        raise ValueError(f"Unsupported balancing mode: {mode}")
+
+    return (weights / weights.mean()).to(dtype=torch.float32)
+
+
+def _save_class_weight_report(
+    counts: torch.Tensor,
+    label_names: Sequence[str],
+    loss_weight_mode: str,
+    loss_weights: torch.Tensor,
+    sampler_weight_mode: str,
+    sampler_weights: torch.Tensor,
+    beta: float,
+    output_path: Path,
+) -> None:
+    """Persist the train-only class-count and weighting diagnostics."""
 
     save_json(
         {
             "computed_from": "train_target_windows_only",
-            "class_weighting_mode": class_weighting_mode,
+            "class_balance_beta": beta,
+            "class_weighting_mode": loss_weight_mode,
+            "sampler_weighting_mode": sampler_weight_mode,
             "counts": {
                 label_names[index]: int(counts[index].item())
-                for index in range(num_classes)
+                for index in range(len(label_names))
             },
             "weights": {
-                label_names[index]: float(weights[index].item())
-                for index in range(num_classes)
+                label_names[index]: float(loss_weights[index].item())
+                for index in range(len(label_names))
+            },
+            "sampler_weights": {
+                label_names[index]: float(sampler_weights[index].item())
+                for index in range(len(label_names))
+            },
+            "loss_weighting": {
+                "mode": loss_weight_mode,
+                "weights": {
+                    label_names[index]: float(loss_weights[index].item())
+                    for index in range(len(label_names))
+                },
+            },
+            "sampler_weighting": {
+                "mode": sampler_weight_mode,
+                "weights": {
+                    label_names[index]: float(sampler_weights[index].item())
+                    for index in range(len(label_names))
+                },
             },
         },
         output_path,
     )
-    return counts, weights
 
 
 def _build_weighted_sampler(
@@ -678,6 +871,45 @@ def _build_weighted_sampler(
         replacement=True,
         generator=generator,
     )
+
+
+def _build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    config: ProjectConfig,
+) -> ReduceLROnPlateau | None:
+    """Construct the configured learning-rate scheduler."""
+
+    if config.training.scheduler_name == "none":
+        return None
+
+    return ReduceLROnPlateau(
+        optimizer=optimizer,
+        mode="max",
+        factor=config.training.scheduler_factor,
+        patience=config.training.scheduler_patience,
+        min_lr=config.training.scheduler_min_lr,
+    )
+
+
+def _build_grad_scaler(amp_enabled: bool) -> Any:
+    """Create a GradScaler compatible with both newer and older PyTorch APIs."""
+
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        try:
+            return torch.amp.GradScaler("cuda", enabled=amp_enabled)
+        except TypeError:
+            return torch.amp.GradScaler(enabled=amp_enabled)
+    return torch.cuda.amp.GradScaler(enabled=amp_enabled)
+
+
+def _resolve_amp_dtype(amp_dtype: str) -> torch.dtype:
+    """Map the configured AMP dtype string to a torch dtype."""
+
+    if amp_dtype == "float16":
+        return torch.float16
+    if amp_dtype == "bfloat16":
+        return torch.bfloat16
+    raise ValueError(f"Unsupported AMP dtype: {amp_dtype}")
 
 
 def _build_training_criterion(
@@ -740,12 +972,18 @@ def _train_one_epoch(
     epoch: int,
     max_epochs: int,
     gradient_clip_norm: float,
-) -> float:
+    scaler: Any,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype,
+) -> dict[str, float | None]:
     """Run one supervised training epoch."""
 
     model.train()
     total_loss = 0.0
     total_examples = 0
+    epoch_start_time = perf_counter()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
     progress = tqdm(dataloader, desc=f"Epoch {epoch}/{max_epochs}", leave=False)
     for batch in progress:
@@ -755,22 +993,34 @@ def _train_one_epoch(
         target_end_indices = batch["target_end_idx"].to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        logits = model(
-            inputs,
-            target_start_indices=target_start_indices,
-            target_end_indices=target_end_indices,
-        )
-        raw_loss = criterion(logits, targets)
-        if raw_loss.ndim > 0:
-            loss = raw_loss.mean()
+        with torch.autocast(
+            device_type=device.type,
+            dtype=amp_dtype,
+            enabled=amp_enabled,
+        ):
+            logits = model(
+                inputs,
+                target_start_indices=target_start_indices,
+                target_end_indices=target_end_indices,
+            )
+            raw_loss = criterion(logits, targets)
+            if raw_loss.ndim > 0:
+                loss = raw_loss.mean()
+            else:
+                loss = raw_loss
+
+        if amp_enabled:
+            scaler.scale(loss).backward()
+            if gradient_clip_norm > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip_norm)
+            scaler.step(optimizer)
+            scaler.update()
         else:
-            loss = raw_loss
-        loss.backward()
-
-        if gradient_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip_norm)
-
-        optimizer.step()
+            loss.backward()
+            if gradient_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip_norm)
+            optimizer.step()
 
         batch_size = targets.size(0)
         if raw_loss.ndim > 0:
@@ -786,7 +1036,17 @@ def _train_one_epoch(
 
     if total_examples == 0:
         raise ValueError("No training samples were available for this epoch.")
-    return total_loss / total_examples
+    duration_seconds = perf_counter() - epoch_start_time
+    max_cuda_memory_mb = None
+    if device.type == "cuda":
+        max_cuda_memory_mb = torch.cuda.max_memory_allocated(device) / (1024**2)
+    return {
+        "loss": total_loss / total_examples,
+        "num_examples": float(total_examples),
+        "duration_seconds": duration_seconds,
+        "examples_per_second": total_examples / max(duration_seconds, 1e-8),
+        "max_cuda_memory_mb": max_cuda_memory_mb,
+    }
 
 
 def _build_split_dataset_summary(
@@ -938,6 +1198,24 @@ def _format_named_values(
         else:
             parts.append(f"{label}={float(value):.{digits}f}")
     return ", ".join(parts)
+
+
+def _weights_to_named_dict(
+    weights: torch.Tensor,
+    label_names: Sequence[str],
+) -> dict[str, float]:
+    """Convert a class-weight tensor into a labeled dictionary."""
+
+    return {
+        label_name: float(weights[index].item())
+        for index, label_name in enumerate(label_names)
+    }
+
+
+def _count_trainable_parameters(model: nn.Module) -> int:
+    """Count the trainable parameters of a model."""
+
+    return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
 
 
 def _checkpoint_config_payload(config: ProjectConfig) -> dict[str, Any]:
