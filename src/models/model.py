@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import TypedDict
 
 import torch
 from torch import nn
 
 from src.config import ModelConfig
+
+
+class ModelForwardOutput(TypedDict, total=False):
+    """Structured forward output used by models with auxiliary diagnostics."""
+
+    logits: torch.Tensor
+    auxiliary_logits: torch.Tensor
+    context_gate: torch.Tensor
 
 
 class ResidualTemporalBlock(nn.Module):
@@ -292,6 +301,122 @@ class TargetContextPooling(nn.Module):
         return self.output_norm(fused_features)
 
 
+class ContextGatedTargetPooling(nn.Module):
+    """Project context into a smaller residual path gated by target evidence."""
+
+    def __init__(
+        self,
+        feature_dim: int,
+        dropout: float,
+        include_context_region: bool,
+        separate_context_regions: bool,
+    ) -> None:
+        super().__init__()
+        self.include_context_region = include_context_region
+        self.separate_context_regions = separate_context_regions and include_context_region
+        self.region_pool = MaskedRegionAttentionPooling(feature_dim=feature_dim, dropout=dropout)
+        self.target_feature_dim = self.region_pool.output_dim
+        context_input_dim = (
+            self.region_pool.output_dim * 3
+            if self.separate_context_regions
+            else self.region_pool.output_dim
+        )
+        self.context_projection = (
+            nn.Sequential(
+                nn.Linear(context_input_dim, self.target_feature_dim),
+                nn.GELU(),
+                nn.Dropout(p=dropout),
+                nn.LayerNorm(self.target_feature_dim),
+            )
+            if include_context_region
+            else None
+        )
+        gate_hidden_dim = max(self.target_feature_dim // 2, 64)
+        self.context_gate = nn.Sequential(
+            nn.Linear(self.target_feature_dim * 3, gate_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(gate_hidden_dim, 1),
+        )
+        self.output_dim = self.target_feature_dim * 3
+        self.output_norm = nn.LayerNorm(self.output_dim)
+
+    def forward(
+        self,
+        sequence_features: torch.Tensor,
+        target_start_indices: torch.Tensor | None,
+        target_end_indices: torch.Tensor | None,
+    ) -> dict[str, torch.Tensor]:
+        target_mask, left_context_mask, right_context_mask = _build_region_masks(
+            sequence_length=sequence_features.size(1),
+            batch_size=sequence_features.size(0),
+            device=sequence_features.device,
+            target_start_indices=target_start_indices,
+            target_end_indices=target_end_indices,
+        )
+        target_features = self.region_pool(sequence_features=sequence_features, mask=target_mask)
+
+        has_context = (left_context_mask.any(dim=1) | right_context_mask.any(dim=1)).unsqueeze(1)
+        if self.include_context_region and self.context_projection is not None:
+            if self.separate_context_regions:
+                left_context_features = self.region_pool(
+                    sequence_features=sequence_features,
+                    mask=left_context_mask,
+                )
+                right_context_features = self.region_pool(
+                    sequence_features=sequence_features,
+                    mask=right_context_mask,
+                )
+                context_features = self.context_projection(
+                    torch.cat(
+                        [
+                            left_context_features,
+                            right_context_features,
+                            left_context_features - right_context_features,
+                        ],
+                        dim=1,
+                    )
+                )
+            else:
+                context_features = self.context_projection(
+                    self.region_pool(
+                        sequence_features=sequence_features,
+                        mask=left_context_mask | right_context_mask,
+                    )
+                )
+        else:
+            context_features = torch.zeros_like(target_features)
+            has_context = torch.zeros_like(has_context, dtype=torch.bool)
+
+        gate_inputs = torch.cat(
+            [
+                target_features,
+                context_features,
+                target_features - context_features,
+            ],
+            dim=1,
+        )
+        context_gate = torch.sigmoid(self.context_gate(gate_inputs))
+        context_gate = context_gate * has_context.to(context_gate.dtype)
+        gated_context = context_features * context_gate
+        fused_features = self.output_norm(
+            torch.cat(
+                [
+                    target_features,
+                    gated_context,
+                    target_features - gated_context,
+                ],
+                dim=1,
+            )
+        )
+        return {
+            "fused_features": fused_features,
+            "target_features": target_features,
+            "context_features": context_features,
+            "context_gate": context_gate.squeeze(1),
+        }
+
+
 class MLPClassifier(nn.Module):
     """Compact classifier head shared across baseline variants."""
 
@@ -540,6 +665,104 @@ class SleepStageCNNBiLSTMTargetPool(SequenceFeatureMixin, nn.Module):
         return self.classifier(pooled_features)
 
 
+class SleepStageCNNBiLSTMContextGated(SequenceFeatureMixin, nn.Module):
+    """CNN+BiLSTM model with a target-first, softly gated context pathway."""
+
+    def __init__(
+        self,
+        input_channels: int,
+        num_classes: int,
+        conv_channels: Sequence[int],
+        kernel_sizes: Sequence[int],
+        conv_dilations: Sequence[int],
+        dropout: float,
+        feature_dropout: float,
+        channel_dropout: float,
+        classifier_hidden_dim: int,
+        lstm_hidden_size: int,
+        lstm_num_layers: int,
+        lstm_dropout: float,
+        use_target_indicator_channel: bool,
+        use_relative_position_channel: bool,
+        pool_context_region: bool,
+        separate_context_regions: bool,
+    ) -> None:
+        super().__init__()
+        self.use_target_indicator_channel = use_target_indicator_channel
+        self.use_relative_position_channel = use_relative_position_channel
+        self.input_regularization = InputRegularization(
+            feature_dropout=feature_dropout,
+            channel_dropout=channel_dropout,
+        )
+        self.encoder = TemporalConvEncoder(
+            input_channels=input_channels + self.extra_input_channels,
+            conv_channels=conv_channels,
+            kernel_sizes=kernel_sizes,
+            dilations=conv_dilations,
+            dropout=dropout,
+        )
+        self.sequence_dropout = nn.Dropout(p=dropout)
+        self.sequence_model = nn.LSTM(
+            input_size=self.encoder.output_channels,
+            hidden_size=lstm_hidden_size,
+            num_layers=lstm_num_layers,
+            dropout=lstm_dropout if lstm_num_layers > 1 else 0.0,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.gated_pool = ContextGatedTargetPooling(
+            feature_dim=lstm_hidden_size * 2,
+            dropout=dropout,
+            include_context_region=pool_context_region,
+            separate_context_regions=separate_context_regions,
+        )
+        self.classifier = MLPClassifier(
+            input_dim=self.gated_pool.output_dim,
+            hidden_dim=classifier_hidden_dim,
+            num_classes=num_classes,
+            dropout=dropout,
+        )
+        self.auxiliary_classifier = MLPClassifier(
+            input_dim=self.gated_pool.target_feature_dim,
+            hidden_dim=classifier_hidden_dim,
+            num_classes=num_classes,
+            dropout=dropout,
+        )
+
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        target_start_indices: torch.Tensor | None = None,
+        target_end_indices: torch.Tensor | None = None,
+    ) -> ModelForwardOutput:
+        inputs = self.input_regularization(inputs)
+        augmented_inputs = self._augment_inputs(
+            inputs=inputs,
+            target_start_indices=target_start_indices,
+            target_end_indices=target_end_indices,
+        )
+        features = self.encoder(augmented_inputs)
+        sequence_features = features.transpose(1, 2).contiguous()
+        sequence_features = self.sequence_dropout(sequence_features)
+
+        lstm_outputs, _ = self.sequence_model(sequence_features)
+        reduced_starts, reduced_ends = self.encoder.downsample_target_bounds(
+            target_start_indices=target_start_indices,
+            target_end_indices=target_end_indices,
+            encoded_length=lstm_outputs.size(1),
+        )
+        pooled_outputs = self.gated_pool(
+            sequence_features=lstm_outputs,
+            target_start_indices=reduced_starts,
+            target_end_indices=reduced_ends,
+        )
+        return {
+            "logits": self.classifier(pooled_outputs["fused_features"]),
+            "auxiliary_logits": self.auxiliary_classifier(pooled_outputs["target_features"]),
+            "context_gate": pooled_outputs["context_gate"],
+        }
+
+
 def build_model(config: ModelConfig) -> nn.Module:
     """Instantiate the configured model variant."""
 
@@ -563,6 +786,13 @@ def build_model(config: ModelConfig) -> nn.Module:
         return SleepStageCNNBaseline(**common_kwargs)
     if config.model_name in {"cnn_bilstm", "cnn_bilstm_target_pool"}:
         return SleepStageCNNBiLSTMTargetPool(
+            **common_kwargs,
+            lstm_hidden_size=config.lstm_hidden_size,
+            lstm_num_layers=config.lstm_num_layers,
+            lstm_dropout=config.lstm_dropout,
+        )
+    if config.model_name == "cnn_bilstm_context_gated":
+        return SleepStageCNNBiLSTMContextGated(
             **common_kwargs,
             lstm_hidden_size=config.lstm_hidden_size,
             lstm_num_layers=config.lstm_num_layers,
