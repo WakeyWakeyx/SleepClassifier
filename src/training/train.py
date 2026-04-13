@@ -8,13 +8,19 @@ import math
 from dataclasses import asdict
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR,
+    LinearLR,
+    ReduceLROnPlateau,
+    SequentialLR,
+)
 from torch.utils.data import DataLoader, Sampler, WeightedRandomSampler
 from tqdm.auto import tqdm
 
@@ -130,6 +136,32 @@ class BalancedSoftmaxLoss(nn.Module):
 
 class SamplerPlan(dict):
     """Lightweight typed container for sampler metadata and reporting."""
+
+
+def _extract_logits(
+    model_outputs: torch.Tensor | Mapping[str, torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Normalize model outputs so the training loop always consumes logits."""
+
+    if isinstance(model_outputs, torch.Tensor):
+        return model_outputs, {}
+    if "logits" not in model_outputs:
+        raise ValueError("Structured model outputs must include a 'logits' tensor.")
+    return model_outputs["logits"], {
+        key: value
+        for key, value in model_outputs.items()
+        if key != "logits"
+    }
+
+
+def _reduce_loss(raw_loss: torch.Tensor, criterion: nn.Module, batch_size: int) -> torch.Tensor:
+    """Reduce arbitrary criterion outputs into a mean-scaled scalar tensor."""
+
+    if raw_loss.ndim > 0:
+        return raw_loss.mean()
+    if getattr(criterion, "reduction", None) == "sum":
+        return raw_loss / max(batch_size, 1)
+    return raw_loss
 
 
 def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
@@ -364,7 +396,7 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
             ),
         )
     sampler_plan = _build_weighted_sampler_plan(
-        labels=train_dataset.labels,
+        dataset=train_dataset,
         class_counts=class_counts,
         class_weights=sampler_class_weights,
         config=config,
@@ -391,6 +423,14 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
             _format_named_values(sampler_plan["expected_class_counts"], digits=1),
             sampler_plan["replacement"],
         )
+        logger.info(
+            "Sampler participants per class | %s",
+            _format_named_values(sampler_plan["participants_per_class"], digits=0),
+        )
+        if sampler_plan.get("participant_balanced_sampling"):
+            logger.info(
+                "Sampler mode | participant-balanced within class to reduce subject concentration."
+            )
 
     train_sampler = sampler_plan["sampler"]
 
@@ -446,6 +486,11 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
     scheduler = _build_scheduler(optimizer=optimizer, config=config)
     scaler = _build_grad_scaler(amp_enabled=amp_enabled)
     logger.info("Training criterion: %s", loss_description)
+    if config.training.auxiliary_target_loss_weight > 0.0:
+        logger.info(
+            "Auxiliary target loss | weight=%.3f",
+            config.training.auxiliary_target_loss_weight,
+        )
     if config.training.loss_name == "balanced_softmax" and config.training.sampler_enabled:
         logger.warning(
             "Balanced softmax is paired with a sampler; prefer bounded sampling and watch stability."
@@ -475,6 +520,7 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
             scaler=scaler,
             amp_enabled=amp_enabled,
             amp_dtype=amp_dtype,
+            auxiliary_target_loss_weight=config.training.auxiliary_target_loss_weight,
         )
         val_metrics = evaluate_model(
             model=model,
@@ -548,7 +594,12 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
                     "num_examples",
                     "split",
                 )
-            },
+            }
+            | (
+                {"model_diagnostics": val_metrics["model_diagnostics"]}
+                if "model_diagnostics" in val_metrics
+                else {}
+            ),
         }
         history.append(epoch_record)
         save_json(history, config.paths.training_history_path)
@@ -593,6 +644,14 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
             "Validation prediction minus target | %s",
             _format_distribution_shift(val_metrics["distribution_shift"]),
         )
+        if val_metrics.get("model_diagnostics"):
+            diagnostics = val_metrics["model_diagnostics"]
+            if "context_gate_mean" in diagnostics:
+                logger.info(
+                    "Validation context gate | mean=%.4f | std=%.4f",
+                    diagnostics["context_gate_mean"],
+                    diagnostics["context_gate_std"],
+                )
         if device.type == "cuda" and train_metrics["max_cuda_memory_mb"] is not None:
             logger.info(
                 "Training GPU peak memory | %.1f MiB (%.1f%% of device total)",
@@ -719,6 +778,14 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
         "Test prediction minus target | %s",
         _format_distribution_shift(test_metrics["distribution_shift"]),
     )
+    if test_metrics.get("model_diagnostics"):
+        diagnostics = test_metrics["model_diagnostics"]
+        if "context_gate_mean" in diagnostics:
+            logger.info(
+                "Test context gate | mean=%.4f | std=%.4f",
+                diagnostics["context_gate_mean"],
+                diagnostics["context_gate_std"],
+            )
 
     summary = {
         "experiment": {
@@ -749,6 +816,7 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
             "use_amp": amp_enabled,
             "amp_dtype": config.training.amp_dtype if amp_enabled else None,
             "scheduler_name": config.training.scheduler_name,
+            "warmup_epochs": config.training.warmup_epochs,
             "deterministic": config.training.deterministic,
             "cudnn_benchmark": config.training.cudnn_benchmark,
             "allow_tf32": config.training.allow_tf32,
@@ -756,6 +824,8 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
             "class_weighting_mode": config.training.class_weighting_mode,
             "sampler_strategy": config.training.resolved_sampler_strategy,
             "use_weighted_sampler": config.training.sampler_enabled,
+            "participant_balanced_sampling": config.training.participant_balanced_sampling,
+            "auxiliary_target_loss_weight": config.training.auxiliary_target_loss_weight,
             "early_stopping_metric": config.training.early_stopping_metric,
         },
         "sequence_definition": _build_windowing_config_summary(config.data),
@@ -1051,13 +1121,14 @@ def _save_class_weight_report(
 
 
 def _build_weighted_sampler_plan(
-    labels: Sequence[int],
+    dataset: WindowedSleepDataset,
     class_counts: torch.Tensor,
     class_weights: torch.Tensor,
     config: ProjectConfig,
 ) -> SamplerPlan:
     """Build a weighted sampler plus a report of its effective class probabilities."""
 
+    labels = dataset.labels
     if not config.training.sampler_enabled:
         return SamplerPlan(
             sampler=None,
@@ -1071,6 +1142,13 @@ def _build_weighted_sampler_plan(
                 label_name: float(class_counts[index].item())
                 for index, label_name in enumerate(config.data.label_names)
             },
+            participants_per_class={
+                label_name: int(
+                    np.count_nonzero(dataset.participant_class_counts_matrix[:, index] > 0)
+                )
+                for index, label_name in enumerate(config.data.label_names)
+            },
+            participant_balanced_sampling=False,
             replacement=False,
             num_samples=len(labels),
         )
@@ -1086,9 +1164,26 @@ def _build_weighted_sampler_plan(
     )
 
     label_tensor = torch.tensor(labels, dtype=torch.long)
-    per_sample_weights = (
-        class_probabilities[label_tensor] / class_counts_float[label_tensor].clamp_min(1.0)
-    )
+    if config.training.participant_balanced_sampling:
+        participant_tensor = torch.tensor(dataset.participant_indices, dtype=torch.long)
+        participant_class_counts = torch.tensor(
+            dataset.participant_class_counts_matrix,
+            dtype=torch.float32,
+        )
+        participants_per_class = torch.tensor(
+            (dataset.participant_class_counts_matrix > 0).sum(axis=0),
+            dtype=torch.float32,
+        )
+        per_sample_group_counts = participant_class_counts[participant_tensor, label_tensor]
+        per_sample_weights = (
+            class_probabilities[label_tensor]
+            / participants_per_class[label_tensor].clamp_min(1.0)
+            / per_sample_group_counts.clamp_min(1.0)
+        )
+    else:
+        per_sample_weights = (
+            class_probabilities[label_tensor] / class_counts_float[label_tensor].clamp_min(1.0)
+        )
     per_sample_weights = (per_sample_weights / per_sample_weights.mean()).double()
     num_samples = max(
         1,
@@ -1115,6 +1210,13 @@ def _build_weighted_sampler_plan(
             label_name: float(class_probabilities[index].item() * num_samples)
             for index, label_name in enumerate(config.data.label_names)
         },
+        participants_per_class={
+            label_name: int(
+                np.count_nonzero(dataset.participant_class_counts_matrix[:, index] > 0)
+            )
+            for index, label_name in enumerate(config.data.label_names)
+        },
+        participant_balanced_sampling=config.training.participant_balanced_sampling,
         replacement=config.training.sampler_replacement,
         num_samples=num_samples,
     )
@@ -1172,7 +1274,7 @@ def _apply_probability_constraints(
 def _build_scheduler(
     optimizer: torch.optim.Optimizer,
     config: ProjectConfig,
-) -> ReduceLROnPlateau | CosineAnnealingLR | None:
+) -> ReduceLROnPlateau | CosineAnnealingLR | SequentialLR | None:
     """Construct the configured learning-rate scheduler."""
 
     if config.training.scheduler_name == "none":
@@ -1182,6 +1284,31 @@ def _build_scheduler(
             optimizer=optimizer,
             T_max=config.training.scheduler_t_max,
             eta_min=config.training.scheduler_eta_min,
+        )
+    if config.training.scheduler_name == "linear_warmup_cosine":
+        warmup_epochs = min(config.training.warmup_epochs, max(config.training.max_epochs - 1, 0))
+        if warmup_epochs <= 0:
+            return CosineAnnealingLR(
+                optimizer=optimizer,
+                T_max=max(config.training.max_epochs, 1),
+                eta_min=config.training.scheduler_eta_min,
+            )
+        warmup_scheduler = LinearLR(
+            optimizer=optimizer,
+            start_factor=0.2,
+            end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+        cosine_epochs = max(config.training.max_epochs - warmup_epochs, 1)
+        cosine_scheduler = CosineAnnealingLR(
+            optimizer=optimizer,
+            T_max=cosine_epochs,
+            eta_min=config.training.scheduler_eta_min,
+        )
+        return SequentialLR(
+            optimizer=optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_epochs],
         )
 
     return ReduceLROnPlateau(
@@ -1202,6 +1329,12 @@ def _describe_scheduler(config: ProjectConfig) -> str:
             f"T_max={config.training.scheduler_t_max}, "
             f"eta_min={config.training.scheduler_eta_min:.2e})"
         )
+    if config.training.scheduler_name == "linear_warmup_cosine":
+        return (
+            "linear_warmup_cosine("
+            f"warmup_epochs={config.training.warmup_epochs}, "
+            f"eta_min={config.training.scheduler_eta_min:.2e})"
+        )
     return (
         "reduce_on_plateau("
         f"factor={config.training.scheduler_factor:.3f}, "
@@ -1211,7 +1344,7 @@ def _describe_scheduler(config: ProjectConfig) -> str:
 
 
 def _step_scheduler(
-    scheduler: ReduceLROnPlateau | CosineAnnealingLR,
+    scheduler: ReduceLROnPlateau | CosineAnnealingLR | SequentialLR,
     config: ProjectConfig,
     monitored_metric: float,
 ) -> None:
@@ -1439,11 +1572,14 @@ def _train_one_epoch(
     scaler: Any,
     amp_enabled: bool,
     amp_dtype: torch.dtype,
+    auxiliary_target_loss_weight: float,
 ) -> dict[str, float | None]:
     """Run one supervised training epoch."""
 
     model.train()
     total_loss = 0.0
+    total_primary_loss = 0.0
+    total_auxiliary_loss = 0.0
     total_examples = 0
     epoch_start_time = perf_counter()
     data_wait_seconds = 0.0
@@ -1468,16 +1604,26 @@ def _train_one_epoch(
             dtype=amp_dtype,
             enabled=amp_enabled,
         ):
-            logits = model(
+            model_outputs = model(
                 inputs,
                 target_start_indices=target_start_indices,
                 target_end_indices=target_end_indices,
             )
+            logits, auxiliary_outputs = _extract_logits(model_outputs)
             raw_loss = criterion(logits, targets)
-            if raw_loss.ndim > 0:
-                loss = raw_loss.mean()
-            else:
-                loss = raw_loss
+            primary_loss = _reduce_loss(raw_loss, criterion=criterion, batch_size=targets.size(0))
+            auxiliary_loss = torch.zeros_like(primary_loss)
+            if (
+                auxiliary_target_loss_weight > 0.0
+                and "auxiliary_logits" in auxiliary_outputs
+            ):
+                auxiliary_raw_loss = criterion(auxiliary_outputs["auxiliary_logits"], targets)
+                auxiliary_loss = _reduce_loss(
+                    auxiliary_raw_loss,
+                    criterion=criterion,
+                    batch_size=targets.size(0),
+                )
+            loss = primary_loss + (auxiliary_target_loss_weight * auxiliary_loss)
 
         if amp_enabled:
             scaler.scale(loss).backward()
@@ -1493,17 +1639,19 @@ def _train_one_epoch(
             optimizer.step()
 
         batch_size = targets.size(0)
-        if raw_loss.ndim > 0:
-            display_loss = raw_loss.mean()
-        elif getattr(criterion, "reduction", None) == "sum":
-            display_loss = raw_loss / max(batch_size, 1)
-        else:
-            display_loss = raw_loss
+        display_loss = loss.detach()
+        display_primary_loss = primary_loss.detach()
+        display_auxiliary_loss = auxiliary_loss.detach()
 
         total_loss += float(display_loss.item()) * batch_size
+        total_primary_loss += float(display_primary_loss.item()) * batch_size
+        total_auxiliary_loss += float(display_auxiliary_loss.item()) * batch_size
         total_examples += batch_size
         compute_seconds += perf_counter() - compute_start_time
-        progress.set_postfix(loss=f"{display_loss.item():.4f}")
+        progress.set_postfix(
+            loss=f"{display_loss.item():.4f}",
+            aux=f"{display_auxiliary_loss.item():.4f}",
+        )
         batch_fetch_start = perf_counter()
 
     if total_examples == 0:
@@ -1519,6 +1667,8 @@ def _train_one_epoch(
         )
     return {
         "loss": total_loss / total_examples,
+        "primary_loss": total_primary_loss / total_examples,
+        "auxiliary_loss": total_auxiliary_loss / total_examples,
         "num_examples": float(total_examples),
         "duration_seconds": duration_seconds,
         "examples_per_second": total_examples / max(duration_seconds, 1e-8),
@@ -1618,6 +1768,37 @@ def _log_window_summary(
                 purity_relative_loss.get("N3", {}).get("relative_to_overall", 0.0),
                 purity_relative_loss.get("R", {}).get("relative_to_overall", 0.0),
             )
+    participant_coverage = dataset.summary.get("participant_class_coverage", {})
+    if participant_coverage:
+        logger.info(
+            (
+                "%s participant coverage | "
+                "N1_nonzero=%d top5=%.2f | N3_nonzero=%d top5=%.2f | R_nonzero=%d top5=%.2f"
+            ),
+            split_name,
+            participant_coverage.get("N1", {}).get("participants_with_any", 0),
+            participant_coverage.get("N1", {}).get("top5_share", 0.0),
+            participant_coverage.get("N3", {}).get("participants_with_any", 0),
+            participant_coverage.get("N3", {}).get("top5_share", 0.0),
+            participant_coverage.get("R", {}).get("participants_with_any", 0),
+            participant_coverage.get("R", {}).get("top5_share", 0.0),
+        )
+    transition_proximity = dataset.summary.get("transition_proximity_by_class", {})
+    if transition_proximity:
+        for threshold_key in ("256", "512"):
+            if threshold_key in transition_proximity:
+                logger.info(
+                    "%s transition proximity <=%s | %s",
+                    split_name,
+                    threshold_key,
+                    ", ".join(
+                        (
+                            f"{label}="
+                            f"{transition_proximity[threshold_key][label]['fraction']:.3f}"
+                        )
+                        for label in dataset.label_names
+                    ),
+                )
 
 
 def _log_sequence_configuration(
@@ -1665,6 +1846,7 @@ def _build_windowing_config_summary(
         "drop_ambiguous_windows": data_config.drop_ambiguous_windows,
         "require_min_valid_labels": data_config.require_min_valid_labels,
         "continuity_gap_factor": data_config.continuity_gap_factor,
+        "transition_distance_thresholds": list(data_config.transition_distance_thresholds),
     }
 
 
