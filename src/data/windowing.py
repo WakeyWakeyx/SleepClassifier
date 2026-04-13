@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import math
 from collections import Counter
 from dataclasses import dataclass
@@ -93,6 +94,14 @@ class ParticipantWindowReport:
         }
 
 
+@dataclass(slots=True)
+class TransitionDiagnostics:
+    """Transition-distance diagnostics collected while retaining windows."""
+
+    counts_within_threshold: dict[int, Counter[int]]
+    distances_by_class: dict[int, list[int]]
+
+
 class WindowedSleepDataset(Dataset[WindowSample]):
     """Slice participant arrays into contiguous sequence windows for one target label."""
 
@@ -115,12 +124,25 @@ class WindowedSleepDataset(Dataset[WindowSample]):
         label_buffer: list[int] = []
         self._signals: list[np.ndarray] = []
         self.participant_summaries: list[dict[str, Any]] = []
+        self.participant_ids = tuple(participant.participant_id for participant in participants)
+        self.participant_class_counts_matrix = np.zeros(
+            (len(participants), len(self.label_names)),
+            dtype=np.int64,
+        )
 
         aggregate_reasons: Counter[str] = Counter()
         aggregate_candidate_class_counts: Counter[str] = Counter()
         aggregate_actual_purity_discards: Counter[str] = Counter()
         aggregate_purity_threshold_failures: Counter[str] = Counter()
         aggregate_discarded_class_counts_by_reason: dict[str, Counter[str]] = {}
+        aggregate_transition_counts: dict[int, Counter[int]] = {
+            threshold: Counter()
+            for threshold in data_config.transition_distance_thresholds
+        }
+        aggregate_transition_distances_by_class: dict[int, list[int]] = {
+            index: []
+            for index in range(len(self.label_names))
+        }
 
         for participant_index, participant in enumerate(participants):
             signal_array = participant.frame.loc[:, self.feature_columns].to_numpy(
@@ -141,7 +163,11 @@ class WindowedSleepDataset(Dataset[WindowSample]):
 
             self._signals.append(signal_array)
             participant.frame = participant.frame.iloc[0:0]
-            participant_windows, participant_summary = _generate_windows_for_participant(
+            (
+                participant_windows,
+                participant_summary,
+                transition_diagnostics,
+            ) = _generate_windows_for_participant(
                 participant_index=participant_index,
                 participant_id=participant.participant_id,
                 source_path=participant.source_path,
@@ -153,6 +179,10 @@ class WindowedSleepDataset(Dataset[WindowSample]):
             self.samples.extend(participant_windows)
             label_buffer.extend(window.label_index for window in participant_windows)
             self.participant_summaries.append(participant_summary.to_dict())
+            for label_index, label_name in enumerate(self.label_names):
+                self.participant_class_counts_matrix[participant_index, label_index] = (
+                    participant_summary.kept_class_counts[label_name]
+                )
             aggregate_reasons.update(participant_summary.discard_reasons)
             aggregate_candidate_class_counts.update(participant_summary.candidate_class_counts)
             aggregate_actual_purity_discards.update(
@@ -165,8 +195,18 @@ class WindowedSleepDataset(Dataset[WindowSample]):
                 aggregate_discarded_class_counts_by_reason.setdefault(reason, Counter()).update(
                     class_counts
                 )
+            for threshold, counts in transition_diagnostics.counts_within_threshold.items():
+                aggregate_transition_counts.setdefault(threshold, Counter()).update(counts)
+            for label_index, distances in transition_diagnostics.distances_by_class.items():
+                aggregate_transition_distances_by_class.setdefault(label_index, []).extend(
+                    distances
+                )
 
         self.labels = np.asarray(label_buffer, dtype=np.int64)
+        self.participant_indices = np.asarray(
+            [window.participant_index for window in self.samples],
+            dtype=np.int64,
+        )
         label_counts = self.label_counts()
         total_candidate_windows = sum(
             report["candidate_windows"] for report in self.participant_summaries
@@ -236,6 +276,19 @@ class WindowedSleepDataset(Dataset[WindowSample]):
                 reason: _counter_to_label_counts(class_counts, self.label_names)
                 for reason, class_counts in sorted(aggregate_discarded_class_counts_by_reason.items())
             },
+            "participant_class_coverage": _build_participant_coverage_summary(
+                participant_summaries=self.participant_summaries,
+                label_names=self.label_names,
+            ),
+            "transition_proximity_by_class": _build_transition_proximity_summary(
+                counts_within_threshold=aggregate_transition_counts,
+                label_counts=label_counts,
+                label_names=self.label_names,
+            ),
+            "median_transition_distance_by_class": _build_transition_median_summary(
+                distances_by_class=aggregate_transition_distances_by_class,
+                label_names=self.label_names,
+            ),
             "sequence_definition": _build_sequence_definition(data_config),
             "participant_summaries": self.participant_summaries,
         }
@@ -317,7 +370,7 @@ def _generate_windows_for_participant(
     timestamps: np.ndarray,
     data_config: DataConfig,
     label_names: Sequence[str],
-) -> tuple[list[WindowMetadata], ParticipantWindowReport]:
+) -> tuple[list[WindowMetadata], ParticipantWindowReport, TransitionDiagnostics]:
     """Create sequence windows and target labels for one participant.
 
     Each retained sample is one contiguous input span:
@@ -349,7 +402,17 @@ def _generate_windows_for_participant(
             discarded_class_counts_by_reason={},
             discard_reasons={"too_short_for_windowing": 1},
         )
-        return windows, report
+        return (
+            windows,
+            report,
+            TransitionDiagnostics(
+                counts_within_threshold={
+                    threshold: Counter()
+                    for threshold in data_config.transition_distance_thresholds
+                },
+                distances_by_class={index: [] for index in range(len(label_names))},
+            ),
+        )
 
     valid_prefix = np.concatenate(
         [np.array([0], dtype=np.int64), np.cumsum(encoded_labels >= 0, dtype=np.int64)]
@@ -367,6 +430,8 @@ def _generate_windows_for_participant(
         timestamps=timestamps,
         continuity_gap_factor=data_config.continuity_gap_factor,
     )
+    transition_change_points = np.flatnonzero(encoded_labels[1:] != encoded_labels[:-1]) + 1
+    transition_change_points_list = transition_change_points.tolist()
 
     min_valid_count = math.ceil(
         data_config.min_valid_fraction * data_config.target_window_length
@@ -377,6 +442,14 @@ def _generate_windows_for_participant(
     actual_purity_discards_by_class: Counter[int] = Counter()
     purity_threshold_failures_by_class: Counter[int] = Counter()
     discarded_class_counts_by_reason: dict[str, Counter[int]] = {}
+    transition_counts_within_threshold: dict[int, Counter[int]] = {
+        threshold: Counter()
+        for threshold in data_config.transition_distance_thresholds
+    }
+    transition_distances_by_class: dict[int, list[int]] = {
+        index: []
+        for index in range(len(label_names))
+    }
 
     for target_start_index in _candidate_target_start_indices(total_rows, data_config):
         candidate_windows += 1
@@ -440,6 +513,17 @@ def _generate_windows_for_participant(
                 label_index=int(assignment.label_index),
             )
         )
+        target_center_index = target_start_index + (data_config.target_window_length // 2)
+        nearest_transition_distance = _nearest_transition_distance(
+            change_points=transition_change_points_list,
+            reference_index=target_center_index,
+        )
+        transition_distances_by_class[int(assignment.label_index)].append(
+            nearest_transition_distance
+        )
+        for threshold in data_config.transition_distance_thresholds:
+            if nearest_transition_distance <= threshold:
+                transition_counts_within_threshold[threshold][int(assignment.label_index)] += 1
 
     kept_label_counts = Counter(window.label_index for window in windows)
     report = ParticipantWindowReport(
@@ -480,7 +564,14 @@ def _generate_windows_for_participant(
             if count > 0
         },
     )
-    return windows, report
+    return (
+        windows,
+        report,
+        TransitionDiagnostics(
+            counts_within_threshold=transition_counts_within_threshold,
+            distances_by_class=transition_distances_by_class,
+        ),
+    )
 
 
 def _resolve_window_assignment(
@@ -619,7 +710,7 @@ def _window_crosses_gap(gap_prefix: np.ndarray, start_index: int, end_index: int
 
 def _build_sequence_definition(
     data_config: DataConfig,
-) -> dict[str, int | float | bool | str]:
+) -> dict[str, Any]:
     """Serialize how each supervised sample is constructed."""
 
     return {
@@ -634,6 +725,7 @@ def _build_sequence_definition(
         "right_context": data_config.effective_right_context,
         "total_input_length": data_config.input_window_length,
         "step": data_config.step,
+        "transition_distance_thresholds": list(data_config.transition_distance_thresholds),
     }
 
 
@@ -687,3 +779,82 @@ def _build_relative_loss_summary(
             ),
         }
     return summary
+
+
+def _build_participant_coverage_summary(
+    participant_summaries: Sequence[Mapping[str, Any]],
+    label_names: Sequence[str],
+) -> dict[str, dict[str, float | int]]:
+    """Summarize how concentrated each class is across participants."""
+
+    coverage: dict[str, dict[str, float | int]] = {}
+    for label_name in label_names:
+        counts = sorted(
+            (
+                int(summary["kept_class_counts"].get(label_name, 0))
+                for summary in participant_summaries
+            ),
+            reverse=True,
+        )
+        total = sum(counts)
+        coverage[label_name] = {
+            "participants_with_any": int(sum(count > 0 for count in counts)),
+            "top1_share": (counts[0] / total) if total > 0 else 0.0,
+            "top5_share": (sum(counts[:5]) / total) if total > 0 else 0.0,
+        }
+    return coverage
+
+
+def _build_transition_proximity_summary(
+    counts_within_threshold: Mapping[int, Counter[int]],
+    label_counts: Mapping[str, int],
+    label_names: Sequence[str],
+) -> dict[str, dict[str, dict[str, float | int]]]:
+    """Serialize transition-proximity counts and fractions by class."""
+
+    summary: dict[str, dict[str, dict[str, float | int]]] = {}
+    for threshold, counts in sorted(counts_within_threshold.items()):
+        threshold_key = str(int(threshold))
+        summary[threshold_key] = {}
+        for label_index, label_name in enumerate(label_names):
+            label_count = int(label_counts.get(label_name, 0))
+            count = int(counts.get(label_index, 0))
+            summary[threshold_key][label_name] = {
+                "count": count,
+                "fraction": (count / label_count) if label_count > 0 else 0.0,
+            }
+    return summary
+
+
+def _build_transition_median_summary(
+    distances_by_class: Mapping[int, Sequence[int]],
+    label_names: Sequence[str],
+) -> dict[str, float]:
+    """Serialize median transition distances for each retained class."""
+
+    summary: dict[str, float] = {}
+    for label_index, label_name in enumerate(label_names):
+        distances = distances_by_class.get(label_index, ())
+        if distances:
+            summary[label_name] = float(np.median(np.asarray(distances, dtype=np.int64)))
+        else:
+            summary[label_name] = 0.0
+    return summary
+
+
+def _nearest_transition_distance(change_points: Sequence[int], reference_index: int) -> int:
+    """Return the distance from a reference index to the nearest label transition."""
+
+    if not change_points:
+        return int(1e9)
+
+    insertion_index = bisect.bisect_left(change_points, reference_index)
+    best_distance = int(1e9)
+    if insertion_index < len(change_points):
+        best_distance = min(best_distance, abs(change_points[insertion_index] - reference_index))
+    if insertion_index > 0:
+        best_distance = min(
+            best_distance,
+            abs(change_points[insertion_index - 1] - reference_index),
+        )
+    return int(best_distance)
