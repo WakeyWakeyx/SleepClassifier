@@ -24,6 +24,7 @@ FEATURE_COLUMNS: tuple[str, ...] = (
 LABEL_NAMES: tuple[str, ...] = ("W", "N1", "N2", "N3", "R")
 EXCLUDED_LABELS: tuple[str, ...] = ("P", "Missing")
 MINORITY_LABELS: tuple[str, ...] = ("N1", "N3", "R")
+TRANSITION_DISTANCE_THRESHOLDS: tuple[int, ...] = (128, 256, 512, 1024)
 
 # Core sequence-window defaults. Each supervised example is one contiguous
 # multichannel time series, and the label is assigned from the target segment only.
@@ -76,6 +77,9 @@ COLLAPSE_RECALL_THRESHOLD = 0.02
 COLLAPSE_PREDICTED_COUNT_THRESHOLD = 2
 COLLAPSE_PREDICTED_FRACTION_THRESHOLD = 0.001
 COLLAPSE_PATIENCE_EPOCHS = 2
+PARTICIPANT_BALANCED_SAMPLING = False
+AUXILIARY_TARGET_LOSS_WEIGHT = 0.0
+WARMUP_EPOCHS = 0
 
 
 def _default_dataset_dir() -> Path:
@@ -189,6 +193,7 @@ class DataConfig:
     drop_ambiguous_windows: bool = True
     require_min_valid_labels: bool = True
     continuity_gap_factor: float = 2.5
+    transition_distance_thresholds: tuple[int, ...] = TRANSITION_DISTANCE_THRESHOLDS
     train_ratio: float = 0.70
     val_ratio: float = 0.15
     test_ratio: float = 0.15
@@ -326,6 +331,9 @@ class TrainingConfig:
     collapse_predicted_count_threshold: int = COLLAPSE_PREDICTED_COUNT_THRESHOLD
     collapse_predicted_fraction_threshold: float = COLLAPSE_PREDICTED_FRACTION_THRESHOLD
     collapse_patience_epochs: int = COLLAPSE_PATIENCE_EPOCHS
+    participant_balanced_sampling: bool = PARTICIPANT_BALANCED_SAMPLING
+    auxiliary_target_loss_weight: float = AUXILIARY_TARGET_LOSS_WEIGHT
+    warmup_epochs: int = WARMUP_EPOCHS
 
     @property
     def resolved_sampler_strategy(self) -> str:
@@ -429,6 +437,143 @@ EXPERIMENT_PRESETS: dict[str, dict[str, Any]] = {
             "class_weighting_mode": "sqrt_inverse_frequency",
             "scheduler_name": "reduce_on_plateau",
             "early_stopping_metric": "macro_f1",
+        },
+    },
+    "target_only_cnn_centered": {
+        "experiment": {
+            "notes": "Serious target-only baseline: simpler CNN, centered labels, no context, and participant-aware sampling.",
+        },
+        "data": {
+            "target_label_strategy": "center_label",
+            "center_label_span": 1,
+            "use_context_windows": False,
+            "left_context": 0,
+            "right_context": 0,
+        },
+        "model": {
+            "model_name": "cnn_baseline",
+            "dropout": 0.25,
+            "pool_context_region": False,
+            "separate_context_regions": False,
+            "use_target_indicator_channel": False,
+        },
+        "training": {
+            "batch_size": 128,
+            "eval_batch_size": 256,
+            "num_workers": 0,
+            "max_epochs": 24,
+            "patience": 6,
+            "learning_rate": 3e-4,
+            "weight_decay": 1e-3,
+            "scheduler_name": "linear_warmup_cosine",
+            "warmup_epochs": 2,
+            "loss_name": "cross_entropy",
+            "use_weighted_sampler": True,
+            "sampler_strategy": "sqrt_inverse_frequency",
+            "participant_balanced_sampling": True,
+            "class_weighting_mode": "none",
+            "early_stopping_metric": "minority_macro_f1",
+        },
+    },
+    "current_arch_centered_stabilized": {
+        "experiment": {
+            "notes": "Current CNN+BiLSTM architecture with centered labels and stabilized participant-aware training.",
+        },
+        "data": {
+            "target_label_strategy": "center_label",
+            "center_label_span": 1,
+        },
+        "model": {
+            "model_name": "cnn_bilstm_target_pool",
+            "dropout": 0.30,
+            "pool_context_region": False,
+            "separate_context_regions": False,
+            "use_target_indicator_channel": False,
+        },
+        "training": {
+            "batch_size": 128,
+            "eval_batch_size": 256,
+            "num_workers": 0,
+            "max_epochs": 24,
+            "patience": 6,
+            "learning_rate": 3e-4,
+            "weight_decay": 1e-3,
+            "scheduler_name": "linear_warmup_cosine",
+            "warmup_epochs": 2,
+            "loss_name": "cross_entropy",
+            "use_weighted_sampler": True,
+            "sampler_strategy": "sqrt_inverse_frequency",
+            "participant_balanced_sampling": True,
+            "class_weighting_mode": "none",
+            "early_stopping_metric": "minority_macro_f1",
+        },
+    },
+    "target_only_bilstm_centered": {
+        "experiment": {
+            "notes": "Target-only BiLSTM ablation to test whether context itself is causing collapse.",
+        },
+        "data": {
+            "target_label_strategy": "center_label",
+            "center_label_span": 1,
+            "use_context_windows": False,
+            "left_context": 0,
+            "right_context": 0,
+        },
+        "model": {
+            "model_name": "cnn_bilstm_target_pool",
+            "dropout": 0.30,
+        },
+        "training": {
+            "batch_size": 128,
+            "eval_batch_size": 256,
+            "num_workers": 0,
+            "max_epochs": 24,
+            "patience": 6,
+            "learning_rate": 3e-4,
+            "weight_decay": 1e-3,
+            "scheduler_name": "linear_warmup_cosine",
+            "warmup_epochs": 2,
+            "loss_name": "cross_entropy",
+            "use_weighted_sampler": True,
+            "sampler_strategy": "sqrt_inverse_frequency",
+            "participant_balanced_sampling": True,
+            "class_weighting_mode": "none",
+            "early_stopping_metric": "minority_macro_f1",
+        },
+    },
+    "context_gated_centered": {
+        "experiment": {
+            "notes": "Promising architecture: centered supervision plus target-first gated context fusion and participant-aware sampling.",
+        },
+        "data": {
+            "target_label_strategy": "center_label",
+            "center_label_span": 1,
+            "use_context_windows": True,
+            "left_context": 256,
+            "right_context": 256,
+        },
+        "model": {
+            "model_name": "cnn_bilstm_context_gated",
+            "dropout": 0.30,
+            "channel_dropout": 0.05,
+        },
+        "training": {
+            "batch_size": 128,
+            "eval_batch_size": 256,
+            "num_workers": 0,
+            "max_epochs": 24,
+            "patience": 6,
+            "learning_rate": 3e-4,
+            "weight_decay": 1e-3,
+            "scheduler_name": "linear_warmup_cosine",
+            "warmup_epochs": 2,
+            "loss_name": "cross_entropy",
+            "use_weighted_sampler": True,
+            "sampler_strategy": "sqrt_inverse_frequency",
+            "participant_balanced_sampling": True,
+            "class_weighting_mode": "none",
+            "auxiliary_target_loss_weight": 0.35,
+            "early_stopping_metric": "minority_macro_f1",
         },
     },
     "sampler_plus_focal": {
@@ -793,9 +938,11 @@ def _validate_config(config: ProjectConfig) -> None:
         "cnn_baseline",
         "cnn_bilstm",
         "cnn_bilstm_target_pool",
+        "cnn_bilstm_context_gated",
     }:
         raise ValueError(
-            "model_name must be 'cnn_baseline', 'cnn_bilstm', or 'cnn_bilstm_target_pool'."
+            "model_name must be 'cnn_baseline', 'cnn_bilstm', "
+            "'cnn_bilstm_target_pool', or 'cnn_bilstm_context_gated'."
         )
     if len(config.model.conv_channels) != len(config.model.kernel_sizes):
         raise ValueError("conv_channels and kernel_sizes must have the same length.")
@@ -850,6 +997,8 @@ def _validate_config(config: ProjectConfig) -> None:
         raise ValueError("min_valid_fraction must be in the interval (0, 1].")
     if config.data.continuity_gap_factor <= 0.0:
         raise ValueError("continuity_gap_factor must be positive.")
+    if any(threshold <= 0 for threshold in config.data.transition_distance_thresholds):
+        raise ValueError("transition_distance_thresholds must contain only positive integers.")
 
     if config.training.loss_name not in {
         "cross_entropy",
@@ -911,9 +1060,11 @@ def _validate_config(config: ProjectConfig) -> None:
         "none",
         "reduce_on_plateau",
         "cosine_annealing",
+        "linear_warmup_cosine",
     }:
         raise ValueError(
-            "scheduler_name must be 'none', 'reduce_on_plateau', or 'cosine_annealing'."
+            "scheduler_name must be 'none', 'reduce_on_plateau', "
+            "'cosine_annealing', or 'linear_warmup_cosine'."
         )
     if not 0.0 < config.training.scheduler_factor < 1.0:
         raise ValueError("scheduler_factor must be in the interval (0, 1).")
@@ -949,6 +1100,12 @@ def _validate_config(config: ProjectConfig) -> None:
         )
     if config.training.collapse_patience_epochs <= 0:
         raise ValueError("collapse_patience_epochs must be positive.")
+    if config.training.warmup_epochs < 0:
+        raise ValueError("warmup_epochs must be non-negative.")
+    if config.training.warmup_epochs >= config.training.max_epochs:
+        raise ValueError("warmup_epochs must be smaller than max_epochs.")
+    if config.training.auxiliary_target_loss_weight < 0.0:
+        raise ValueError("auxiliary_target_loss_weight must be non-negative.")
     if (
         config.training.focal_alpha is not None
         and len(config.training.focal_alpha) != config.model.num_classes
