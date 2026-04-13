@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import torch
 from torch import nn
@@ -41,6 +41,7 @@ def evaluate_model(
     total_examples = 0
     all_targets: list[int] = []
     all_predictions: list[int] = []
+    context_gate_values: list[torch.Tensor] = []
 
     progress = tqdm(dataloader, desc=f"Evaluating {split_name}", leave=False)
     for batch in progress:
@@ -54,11 +55,12 @@ def evaluate_model(
             dtype=amp_dtype,
             enabled=amp_enabled,
         ):
-            logits = model(
+            model_outputs = model(
                 inputs,
                 target_start_indices=target_start_indices,
                 target_end_indices=target_end_indices,
             )
+            logits, auxiliary_outputs = _extract_logits(model_outputs)
             raw_loss = criterion(logits, targets)
         if raw_loss.ndim > 0:
             loss = raw_loss.mean()
@@ -74,6 +76,9 @@ def evaluate_model(
         predictions = logits.argmax(dim=1)
         all_targets.extend(targets.cpu().tolist())
         all_predictions.extend(predictions.cpu().tolist())
+        context_gate = auxiliary_outputs.get("context_gate")
+        if context_gate is not None:
+            context_gate_values.append(context_gate.detach().float().cpu())
 
     if total_examples == 0:
         raise ValueError(f"No evaluation samples were available for split '{split_name}'.")
@@ -87,6 +92,12 @@ def evaluate_model(
     metrics["loss"] = total_loss / total_examples
     metrics["num_examples"] = total_examples
     metrics["split"] = split_name
+    if context_gate_values:
+        concatenated = torch.cat(context_gate_values)
+        metrics["model_diagnostics"] = {
+            "context_gate_mean": float(concatenated.mean().item()),
+            "context_gate_std": float(concatenated.std(unbiased=False).item()),
+        }
     return metrics
 
 
@@ -121,3 +132,19 @@ def save_evaluation_artifacts(
         output_path=output_dir / f"{artifact_prefix}_confusion_matrix.png",
         title=title,
     )
+
+
+def _extract_logits(
+    model_outputs: torch.Tensor | Mapping[str, torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Normalize model outputs so evaluation always consumes primary logits."""
+
+    if isinstance(model_outputs, torch.Tensor):
+        return model_outputs, {}
+    if "logits" not in model_outputs:
+        raise ValueError("Structured model outputs must include a 'logits' tensor.")
+    return model_outputs["logits"], {
+        key: value
+        for key, value in model_outputs.items()
+        if key != "logits"
+    }
