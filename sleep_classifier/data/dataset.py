@@ -4,18 +4,25 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
 from sleep_classifier.config import ExperimentConfig
 from sleep_classifier.data.preprocessing import (
+    CachedParticipantData,
     ParticipantSummary,
-    build_windows_from_clean_dataframe,
+    build_window_manifest_rows,
+    extract_window_features,
     load_and_clean_participant_csv,
+    load_cached_participant,
+    participant_summary_from_dict,
     participant_summary_to_dict,
+    save_cached_participant,
     summarize_participant,
 )
 from sleep_classifier.data.scan_dataset import ParticipantFile, scan_dataset_files
@@ -48,13 +55,14 @@ class PreparedDataBundle:
     participant_files: dict[str, ParticipantFile]
     summaries: list[ParticipantSummary]
     splits: ParticipantSplits
-    normalization_stats: dict[str, list[float]]
+    normalization_stats: dict[str, Any]
     class_weights: list[float]
     prepared_splits: dict[str, PreparedSplitData]
+    window_manifest: pd.DataFrame
 
 
 class SleepWindowDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
-    """Simple tensor dataset for windowed time-series classification."""
+    """Simple tensor dataset for context-window time-series classification."""
 
     def __init__(self, features: np.ndarray, labels: np.ndarray) -> None:
         if features.ndim != 3:
@@ -73,20 +81,76 @@ class SleepWindowDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         return self.features[index], self.labels[index]
 
 
+class ParticipantStore:
+    """Lazy participant cache backed by in-memory objects and saved npz files."""
+
+    def __init__(
+        self,
+        cache_paths: dict[str, Path],
+        initial_cache: dict[str, CachedParticipantData] | None = None,
+    ) -> None:
+        self.cache_paths = dict(cache_paths)
+        self._loaded = dict(initial_cache or {})
+
+    def load(self, participant_id: str) -> CachedParticipantData:
+        if participant_id not in self._loaded:
+            cache_path = self.cache_paths.get(participant_id)
+            if cache_path is None:
+                raise KeyError(f"No cached participant available for {participant_id}")
+            self._loaded[participant_id] = load_cached_participant(cache_path)
+        return self._loaded[participant_id]
+
+
+def _normalize_features(features: np.ndarray, stats: dict[str, Any]) -> np.ndarray:
+    mean = np.asarray(stats["mean"], dtype=np.float32).reshape(1, -1, 1)
+    std = np.asarray(stats["std"], dtype=np.float32).reshape(1, -1, 1)
+    return (features - mean) / std
+
+
+def _participant_cache_path(config: ExperimentConfig, participant_id: str) -> Path:
+    return config.cleaned_participants_dir / f"{participant_id}.npz"
+
+
+def _load_existing_summary_lookup(config: ExperimentConfig) -> dict[str, ParticipantSummary]:
+    if not config.use_cache or config.rebuild_cache or not config.participant_summary_path.exists():
+        return {}
+    payload = load_json(config.participant_summary_path)
+    return {
+        item["participant_id"]: participant_summary_from_dict(item)
+        for item in payload.get("participants", [])
+    }
+
+
 def _collect_participant_summaries(
     participant_files: list[ParticipantFile],
     config: ExperimentConfig,
     logger: logging.Logger,
-) -> tuple[list[ParticipantSummary], dict[str, ParticipantFile]]:
+) -> tuple[list[ParticipantSummary], dict[str, ParticipantFile], ParticipantStore]:
     summaries: list[ParticipantSummary] = []
     file_lookup: dict[str, ParticipantFile] = {}
+    in_memory_cache: dict[str, CachedParticipantData] = {}
+    cache_paths: dict[str, Path] = {}
+    summary_lookup = _load_existing_summary_lookup(config)
     skipped_files = 0
 
     for participant_file in participant_files:
-        file_lookup[participant_file.participant_id] = participant_file
+        participant_id = participant_file.participant_id
+        file_lookup[participant_id] = participant_file
+        cache_path = _participant_cache_path(config, participant_id)
+        cache_paths[participant_id] = cache_path
+
+        if (
+            config.use_cache
+            and not config.rebuild_cache
+            and cache_path.exists()
+            and participant_id in summary_lookup
+        ):
+            summaries.append(summary_lookup[participant_id])
+            continue
+
         cleaned = load_and_clean_participant_csv(
             file_path=participant_file.file_path,
-            participant_id=participant_file.participant_id,
+            participant_id=participant_id,
             config=config,
             logger=logger,
         )
@@ -97,148 +161,48 @@ def _collect_participant_summaries(
         summary = summarize_participant(cleaned, config)
         if summary.window_count == 0:
             logger.warning(
-                "Skipping %s because no usable windows were produced after cleaning.",
+                "Skipping %s because no usable context windows were produced after cleaning.",
                 participant_file.file_path.name,
             )
             skipped_files += 1
             continue
+
         summaries.append(summary)
+        in_memory_cache[participant_id] = cleaned
+        if config.use_cache:
+            save_cached_participant(cleaned, cache_path)
 
     if not summaries:
         raise ValueError("All scanned files were invalid or produced zero usable windows.")
+
+    usable_ids = {summary.participant_id for summary in summaries}
+    filtered_lookup = {
+        participant_id: participant_file
+        for participant_id, participant_file in file_lookup.items()
+        if participant_id in usable_ids
+    }
+    filtered_cache_paths = {
+        participant_id: cache_path
+        for participant_id, cache_path in cache_paths.items()
+        if participant_id in usable_ids
+    }
+    if config.use_cache:
+        save_json(
+            {
+                "dataset_root": str(config.dataset_root),
+                "limit_files": config.limit_files,
+                "input_feature_columns": list(config.input_feature_columns),
+                "participants": [participant_summary_to_dict(summary) for summary in summaries],
+            },
+            config.participant_summary_path,
+        )
 
     logger.info(
         "Prepared participant summaries for %d file(s); skipped %d file(s).",
         len(summaries),
         skipped_files,
     )
-    return summaries, file_lookup
-
-
-def _compute_normalization_stats(
-    participant_ids: list[str],
-    participant_files: dict[str, ParticipantFile],
-    config: ExperimentConfig,
-    logger: logging.Logger,
-) -> dict[str, list[float]]:
-    sums = np.zeros(len(config.feature_columns), dtype=np.float64)
-    squared_sums = np.zeros(len(config.feature_columns), dtype=np.float64)
-    total_values = 0
-
-    for participant_id in participant_ids:
-        participant_file = participant_files[participant_id]
-        cleaned = load_and_clean_participant_csv(
-            file_path=participant_file.file_path,
-            participant_id=participant_id,
-            config=config,
-            logger=logger,
-        )
-        if cleaned is None:
-            continue
-        windowed = build_windows_from_clean_dataframe(cleaned, config, include_features=True)
-        if windowed.features is None or len(windowed.features) == 0:
-            continue
-        features = windowed.features.astype(np.float64, copy=False)
-        sums += features.sum(axis=(0, 2))
-        squared_sums += np.square(features).sum(axis=(0, 2))
-        total_values += int(features.shape[0] * features.shape[2])
-
-    if total_values == 0:
-        raise ValueError("Zero training windows available to compute normalization statistics.")
-
-    means = sums / total_values
-    variances = (squared_sums / total_values) - np.square(means)
-    stds = np.sqrt(np.maximum(variances, 1e-8))
-    return {
-        "mean": means.tolist(),
-        "std": stds.tolist(),
-        "feature_columns": list(config.feature_columns),
-    }
-
-
-def _compute_class_weights_from_summaries(
-    train_participant_ids: list[str],
-    summary_lookup: dict[str, ParticipantSummary],
-) -> tuple[list[float], dict[str, int]]:
-    name_to_id = {name: idx for idx, name in ID_TO_NAME.items()}
-    counts = np.zeros(len(ID_TO_NAME), dtype=np.int64)
-    for participant_id in train_participant_ids:
-        summary = summary_lookup[participant_id]
-        for class_name, count in summary.window_class_counts.items():
-            counts[name_to_id[class_name]] += int(count)
-
-    if counts.sum() == 0:
-        raise ValueError("Training split contains zero windows.")
-
-    safe_counts = np.maximum(counts, 1)
-    weights = counts.sum() / (len(counts) * safe_counts.astype(np.float64))
-    label_counts = {ID_TO_NAME[idx]: int(count) for idx, count in enumerate(counts)}
-    return weights.tolist(), label_counts
-
-
-def _normalize_features(features: np.ndarray, normalization_stats: dict[str, list[float]]) -> np.ndarray:
-    mean = np.asarray(normalization_stats["mean"], dtype=np.float32).reshape(1, -1, 1)
-    std = np.asarray(normalization_stats["std"], dtype=np.float32).reshape(1, -1, 1)
-    return (features - mean) / std
-
-
-def _prepare_split_arrays(
-    split_name: str,
-    participant_ids: list[str],
-    participant_files: dict[str, ParticipantFile],
-    config: ExperimentConfig,
-    normalization_stats: dict[str, list[float]],
-    logger: logging.Logger,
-) -> PreparedSplitData:
-    features_list: list[np.ndarray] = []
-    labels_list: list[np.ndarray] = []
-    metadata: list[dict[str, Any]] = []
-
-    for participant_id in participant_ids:
-        participant_file = participant_files[participant_id]
-        cleaned = load_and_clean_participant_csv(
-            file_path=participant_file.file_path,
-            participant_id=participant_id,
-            config=config,
-            logger=logger,
-        )
-        if cleaned is None:
-            continue
-        windowed = build_windows_from_clean_dataframe(cleaned, config, include_features=True)
-        if windowed.features is None or len(windowed.features) == 0:
-            continue
-        normalized_features = _normalize_features(windowed.features, normalization_stats)
-        features_list.append(normalized_features.astype(np.float32, copy=False))
-        labels_list.append(windowed.labels.astype(np.int64, copy=False))
-
-        for index, (start_timestamp, end_timestamp, label_id) in enumerate(
-            zip(windowed.start_timestamps, windowed.end_timestamps, windowed.labels, strict=True)
-        ):
-            metadata.append(
-                {
-                    "participant_id": participant_id,
-                    "window_index": index,
-                    "window_start_timestamp": float(start_timestamp),
-                    "window_end_timestamp": float(end_timestamp),
-                    "label_id": int(label_id),
-                    "label_name": ID_TO_NAME[int(label_id)],
-                }
-            )
-
-    if not features_list:
-        raise ValueError(f"Split '{split_name}' produced zero usable windows.")
-
-    features = np.concatenate(features_list, axis=0)
-    labels = np.concatenate(labels_list, axis=0)
-    label_counts = np.bincount(labels, minlength=len(ID_TO_NAME))
-
-    return PreparedSplitData(
-        name=split_name,
-        dataset=SleepWindowDataset(features=features, labels=labels),
-        metadata=metadata,
-        label_counts={ID_TO_NAME[idx]: int(count) for idx, count in enumerate(label_counts)},
-        num_windows=int(len(labels)),
-    )
+    return summaries, filtered_lookup, ParticipantStore(filtered_cache_paths, initial_cache=in_memory_cache)
 
 
 def _load_or_create_splits(
@@ -246,7 +210,7 @@ def _load_or_create_splits(
     config: ExperimentConfig,
     logger: logging.Logger,
 ) -> ParticipantSplits:
-    if config.split_path.exists():
+    if config.use_cache and config.split_path.exists() and not config.rebuild_cache:
         payload = load_json(config.split_path)
         available_ids = {summary.participant_id for summary in summaries}
         splits = load_existing_splits(payload, available_ids)
@@ -259,50 +223,190 @@ def _load_or_create_splits(
     return splits
 
 
-def _load_or_compute_normalization_stats(
+def _build_window_manifest(
+    participant_store: ParticipantStore,
     splits: ParticipantSplits,
-    participant_files: dict[str, ParticipantFile],
     config: ExperimentConfig,
     logger: logging.Logger,
-) -> dict[str, list[float]]:
-    if config.normalization_path.exists():
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    split_to_ids = {
+        "train": splits.train,
+        "val": splits.val,
+        "test": splits.test,
+    }
+    for split_name, participant_ids in split_to_ids.items():
+        stride_seconds = config.stride_seconds_for_split(split_name)
+        for participant_id in participant_ids:
+            cleaned = participant_store.load(participant_id)
+            participant_rows, skipped_low_quality, skipped_short = build_window_manifest_rows(
+                cleaned=cleaned,
+                config=config,
+                split_name=split_name,
+                stride_seconds=stride_seconds,
+            )
+            if skipped_low_quality:
+                logger.info(
+                    "Skipped %d low-quality %s window(s) for participant %s.",
+                    skipped_low_quality,
+                    split_name,
+                    participant_id,
+                )
+            if skipped_short:
+                logger.info(
+                    "Participant %s is too short for %s context windows.",
+                    participant_id,
+                    split_name,
+                )
+            rows.extend(participant_rows)
+
+    if not rows:
+        raise ValueError("Window manifest generation produced zero windows across all splits.")
+
+    manifest = pd.DataFrame(rows)
+    manifest = manifest.sort_values(
+        ["split", "participant_id", "window_index"],
+        kind="mergesort",
+    ).reset_index(drop=True)
+    manifest.to_csv(config.window_manifest_path, index=False)
+    logger.info("Saved window manifest to %s.", config.window_manifest_path)
+    return manifest
+
+
+def _load_or_create_window_manifest(
+    participant_store: ParticipantStore,
+    splits: ParticipantSplits,
+    config: ExperimentConfig,
+    logger: logging.Logger,
+) -> pd.DataFrame:
+    if config.use_cache and config.window_manifest_path.exists() and not config.rebuild_cache:
+        manifest = pd.read_csv(config.window_manifest_path)
+        logger.info("Loaded window manifest from %s.", config.window_manifest_path)
+        return manifest
+    return _build_window_manifest(participant_store, splits, config, logger)
+
+
+def _compute_feature_stats(feature_matrix: np.ndarray) -> dict[str, list[float]]:
+    means = feature_matrix.mean(axis=0, dtype=np.float64)
+    stds = np.maximum(feature_matrix.std(axis=0, dtype=np.float64), 1e-6)
+    return {
+        "mean": means.tolist(),
+        "std": stds.tolist(),
+    }
+
+
+def _load_or_compute_normalization_stats(
+    participant_store: ParticipantStore,
+    manifest: pd.DataFrame,
+    splits: ParticipantSplits,
+    config: ExperimentConfig,
+    logger: logging.Logger,
+) -> dict[str, Any]:
+    if config.use_cache and config.normalization_path.exists() and not config.rebuild_cache:
         payload = load_json(config.normalization_path)
         logger.info("Loaded normalization statistics from %s.", config.normalization_path)
         return payload
 
-    stats = _compute_normalization_stats(
-        participant_ids=splits.train,
-        participant_files=participant_files,
-        config=config,
-        logger=logger,
-    )
-    save_json(stats, config.normalization_path)
+    if config.normalization_mode == "global_train":
+        train_features: list[np.ndarray] = []
+        for participant_id in splits.train:
+            cleaned = participant_store.load(participant_id)
+            train_features.append(cleaned.features.astype(np.float32, copy=False))
+        if not train_features:
+            raise ValueError("Zero training participants available to compute normalization statistics.")
+        feature_matrix = np.concatenate(train_features, axis=0)
+        stats = _compute_feature_stats(feature_matrix)
+        payload: dict[str, Any] = {
+            "mode": "global_train",
+            "feature_columns": list(config.input_feature_columns),
+            **stats,
+        }
+    else:
+        participant_stats: dict[str, dict[str, Any]] = {}
+        participant_ids = sorted(set(manifest["participant_id"].tolist()))
+        for participant_id in participant_ids:
+            cleaned = participant_store.load(participant_id)
+            participant_stats[participant_id] = _compute_feature_stats(cleaned.features.astype(np.float32, copy=False))
+        payload = {
+            "mode": "participant",
+            "feature_columns": list(config.input_feature_columns),
+            "participants": participant_stats,
+        }
+
+    save_json(payload, config.normalization_path)
     logger.info("Saved normalization statistics to %s.", config.normalization_path)
-    return stats
+    return payload
 
 
 def _load_or_compute_class_weights(
-    splits: ParticipantSplits,
-    summaries: list[ParticipantSummary],
+    manifest: pd.DataFrame,
     config: ExperimentConfig,
     logger: logging.Logger,
 ) -> list[float]:
-    if config.class_weights_path.exists():
+    if config.use_cache and config.class_weights_path.exists() and not config.rebuild_cache:
         payload = load_json(config.class_weights_path)
         logger.info("Loaded class weights from %s.", config.class_weights_path)
         return list(payload["class_weights"])
 
-    summary_lookup = {summary.participant_id: summary for summary in summaries}
-    class_weights, label_counts = _compute_class_weights_from_summaries(splits.train, summary_lookup)
-    save_json(
-        {
-            "class_weights": class_weights,
-            "train_label_counts": label_counts,
-        },
-        config.class_weights_path,
-    )
+    train_manifest = manifest.loc[manifest["split"] == "train"]
+    counts = np.bincount(train_manifest["label_id"].to_numpy(dtype=np.int64), minlength=len(ID_TO_NAME))
+    if counts.sum() == 0:
+        raise ValueError("Training split contains zero windows.")
+
+    safe_counts = np.maximum(counts, 1)
+    weights = counts.sum() / (len(counts) * safe_counts.astype(np.float64))
+    payload = {
+        "class_weights": weights.tolist(),
+        "train_label_counts": {ID_TO_NAME[idx]: int(count) for idx, count in enumerate(counts)},
+    }
+    save_json(payload, config.class_weights_path)
     logger.info("Saved class weights to %s.", config.class_weights_path)
-    return class_weights
+    return weights.tolist()
+
+
+def _stats_for_participant(
+    normalization_stats: dict[str, Any],
+    participant_id: str,
+) -> dict[str, Any]:
+    if normalization_stats["mode"] == "global_train":
+        return normalization_stats
+    return normalization_stats["participants"][participant_id]
+
+
+def _prepare_split_arrays(
+    split_name: str,
+    manifest: pd.DataFrame,
+    participant_store: ParticipantStore,
+    normalization_stats: dict[str, Any],
+) -> PreparedSplitData:
+    split_manifest = manifest.loc[manifest["split"] == split_name].copy()
+    if split_manifest.empty:
+        raise ValueError(f"Split '{split_name}' produced zero usable windows.")
+
+    feature_batches: list[np.ndarray] = []
+    label_batches: list[np.ndarray] = []
+    metadata: list[dict[str, Any]] = []
+    for participant_id, participant_frame in split_manifest.groupby("participant_id", sort=False):
+        participant_frame = participant_frame.sort_values("window_index", kind="mergesort")
+        cleaned = participant_store.load(participant_id)
+        window_features = extract_window_features(cleaned, participant_frame)
+        stats = _stats_for_participant(normalization_stats, participant_id)
+        normalized_features = _normalize_features(window_features, stats)
+        labels = participant_frame["label_id"].to_numpy(dtype=np.int64)
+        feature_batches.append(normalized_features.astype(np.float32, copy=False))
+        label_batches.append(labels)
+        metadata.extend(participant_frame.to_dict(orient="records"))
+
+    features = np.concatenate(feature_batches, axis=0)
+    labels = np.concatenate(label_batches, axis=0)
+    label_counts = np.bincount(labels, minlength=len(ID_TO_NAME))
+    return PreparedSplitData(
+        name=split_name,
+        dataset=SleepWindowDataset(features=features, labels=labels),
+        metadata=metadata,
+        label_counts={ID_TO_NAME[idx]: int(count) for idx, count in enumerate(label_counts)},
+        num_windows=int(len(labels)),
+    )
 
 
 def prepare_datasets(
@@ -310,7 +414,7 @@ def prepare_datasets(
     logger: logging.Logger,
     requested_splits: tuple[str, ...] = ("train", "val", "test"),
 ) -> PreparedDataBundle:
-    """Run the full data preparation pipeline."""
+    """Run the cached data preparation pipeline."""
 
     config.validate()
     config.ensure_output_dirs()
@@ -320,45 +424,56 @@ def prepare_datasets(
         logger=logger,
         limit_files=config.limit_files,
     )
-    summaries, participant_lookup = _collect_participant_summaries(participant_files, config, logger)
-    save_json(
-        {
-            "dataset_root": str(config.dataset_root),
-            "limit_files": config.limit_files,
-            "participants": [participant_summary_to_dict(summary) for summary in summaries],
-        },
-        config.manifest_path,
+    summaries, participant_lookup, participant_store = _collect_participant_summaries(
+        participant_files,
+        config,
+        logger,
     )
-
     splits = _load_or_create_splits(summaries, config, logger)
-    normalization_stats = _load_or_compute_normalization_stats(splits, participant_lookup, config, logger)
-    class_weights = _load_or_compute_class_weights(splits, summaries, config, logger)
+    window_manifest = _load_or_create_window_manifest(participant_store, splits, config, logger)
+    normalization_stats = _load_or_compute_normalization_stats(
+        participant_store=participant_store,
+        manifest=window_manifest,
+        splits=splits,
+        config=config,
+        logger=logger,
+    )
+    class_weights = _load_or_compute_class_weights(window_manifest, config, logger)
+
+    prepared_splits: dict[str, PreparedSplitData] = {}
+    for split_name in requested_splits:
+        prepared_splits[split_name] = _prepare_split_arrays(
+            split_name=split_name,
+            manifest=window_manifest,
+            participant_store=participant_store,
+            normalization_stats=normalization_stats,
+        )
 
     split_to_ids = {
         "train": splits.train,
         "val": splits.val,
         "test": splits.test,
     }
-    prepared_splits: dict[str, PreparedSplitData] = {}
-    for split_name in requested_splits:
-        prepared_splits[split_name] = _prepare_split_arrays(
-            split_name=split_name,
-            participant_ids=split_to_ids[split_name],
-            participant_files=participant_lookup,
-            config=config,
-            normalization_stats=normalization_stats,
-            logger=logger,
-        )
-
     summary_lookup = {summary.participant_id: summary for summary in summaries}
     dataset_summary = {
         "requested_splits": list(requested_splits),
+        "context_window_seconds": config.context_window_seconds,
+        "center_epoch_seconds": config.center_epoch_seconds,
+        "train_stride_seconds": config.train_stride_seconds,
+        "val_stride_seconds": config.val_stride_seconds,
+        "test_stride_seconds": config.test_stride_seconds,
+        "input_feature_columns": list(config.input_feature_columns),
+        "normalization_mode": config.normalization_mode,
         "splits": {
             split_name: {
                 "participants": split_to_ids[split_name],
                 "participant_count": len(split_to_ids[split_name]),
-                "num_windows": prepared_splits[split_name].num_windows if split_name in prepared_splits else None,
-                "window_label_counts": prepared_splits[split_name].label_counts if split_name in prepared_splits else None,
+                "num_windows": int((window_manifest["split"] == split_name).sum()),
+                "window_label_counts": (
+                    prepared_splits[split_name].label_counts
+                    if split_name in prepared_splits
+                    else None
+                ),
                 "source_window_counts_by_participant": {
                     participant_id: summary_lookup[participant_id].window_count
                     for participant_id in split_to_ids[split_name]
@@ -377,4 +492,5 @@ def prepare_datasets(
         normalization_stats=normalization_stats,
         class_weights=class_weights,
         prepared_splits=prepared_splits,
+        window_manifest=window_manifest,
     )
