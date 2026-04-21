@@ -45,3 +45,8 @@ def build_loss(config: ExperimentConfig, class_weights: torch.Tensor) -> nn.Modu
     if config.loss_name == "focal":
         return FocalLoss(gamma=config.focal_gamma, weight=class_weights)
     raise ValueError(f"Unsupported loss '{config.loss_name}'.")
+
+
+from sleep_classifier.multitask_losses import FocalLoss as MultiTaskFocalLoss, MultiTaskLoss, build_loss as build_multitask_loss
+
+FocalLoss = MultiTaskFocalLoss
