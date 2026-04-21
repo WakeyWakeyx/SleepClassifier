@@ -53,7 +53,10 @@ class ResidualConvBlock(nn.Module):
         self.bn2 = nn.BatchNorm1d(channels)
         self.dropout = nn.Dropout(dropout)
         self.shortcut = (
-            nn.AvgPool1d(kernel_size=stride, stride=stride)
+            nn.Sequential(
+                nn.Conv1d(channels, channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm1d(channels),
+            )
             if stride > 1
             else nn.Identity()
         )
