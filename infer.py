@@ -14,7 +14,7 @@ from sleep_classifier.config import ExperimentConfig, apply_common_overrides
 from sleep_classifier.data.preprocessing import build_windows_from_clean_dataframe, load_and_clean_participant_csv
 from sleep_classifier.data.scan_dataset import extract_participant_id
 from sleep_classifier.label_mapping import ID_TO_NAME, get_class_names
-from sleep_classifier.models import SleepStageCNN1D
+from sleep_classifier.models import build_model
 from sleep_classifier.utils import build_logger, configure_torch_runtime, get_device
 
 
@@ -43,9 +43,24 @@ def initialize_config(checkpoint_path: Path, args: argparse.Namespace) -> tuple[
     return config, checkpoint
 
 
-def normalize_features(features: np.ndarray, normalization_stats: dict[str, list[float]]) -> np.ndarray:
-    mean = np.asarray(normalization_stats["mean"], dtype=np.float32).reshape(1, -1, 1)
-    std = np.asarray(normalization_stats["std"], dtype=np.float32).reshape(1, -1, 1)
+def normalize_features(
+    features: np.ndarray,
+    normalization_stats: dict[str, object],
+    participant_features: np.ndarray,
+    participant_id: str,
+) -> np.ndarray:
+    if normalization_stats.get("mode") == "participant":
+        participant_stats = normalization_stats.get("participants", {}).get(participant_id)
+        if participant_stats is None:
+            participant_stats = {
+                "mean": participant_features.mean(axis=0, dtype=np.float64).tolist(),
+                "std": np.maximum(participant_features.std(axis=0, dtype=np.float64), 1e-6).tolist(),
+            }
+        mean = np.asarray(participant_stats["mean"], dtype=np.float32).reshape(1, -1, 1)
+        std = np.asarray(participant_stats["std"], dtype=np.float32).reshape(1, -1, 1)
+    else:
+        mean = np.asarray(normalization_stats["mean"], dtype=np.float32).reshape(1, -1, 1)
+        std = np.asarray(normalization_stats["std"], dtype=np.float32).reshape(1, -1, 1)
     return (features - mean) / std
 
 
@@ -74,7 +89,12 @@ def main() -> None:
     if normalization_stats is None:
         raise ValueError("Checkpoint is missing normalization statistics required for inference.")
 
-    normalized_features = normalize_features(windowed.features, normalization_stats)
+    normalized_features = normalize_features(
+        windowed.features,
+        normalization_stats,
+        cleaned.features,
+        participant_id,
+    )
     dataset = TensorDataset(torch.from_numpy(normalized_features.astype(np.float32, copy=False)))
     data_loader = DataLoader(
         dataset,
@@ -85,11 +105,7 @@ def main() -> None:
         persistent_workers=config.num_workers > 0,
     )
 
-    model = SleepStageCNN1D(
-        input_channels=len(config.feature_columns),
-        num_classes=len(get_class_names()),
-        dropout=config.dropout,
-    ).to(device)
+    model = build_model(config=config, num_classes=len(get_class_names())).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
@@ -98,7 +114,7 @@ def main() -> None:
     with torch.no_grad():
         for (inputs,) in data_loader:
             inputs = inputs.to(device, non_blocking=device.type == "cuda")
-            with torch.cuda.amp.autocast(enabled=use_mixed_precision):
+            with torch.amp.autocast(device_type=device.type, enabled=use_mixed_precision):
                 logits = model(inputs)
             probabilities.append(torch.softmax(logits, dim=1).cpu().numpy())
 
