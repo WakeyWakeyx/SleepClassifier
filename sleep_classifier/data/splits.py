@@ -9,8 +9,8 @@ from typing import Any
 
 from sklearn.model_selection import train_test_split
 
-from sleep_classifier.config import ExperimentConfig
-from sleep_classifier.data.preprocessing import ParticipantSummary
+from sleep_classifier.data.epoch_preprocessing import ParticipantSummary
+from sleep_classifier.experiment_config import ExperimentConfig
 
 
 @dataclass(slots=True)
@@ -135,7 +135,7 @@ def create_participant_splits(
 
     participant_ids = [summary.participant_id for summary in usable]
     dominant_labels = [
-        summary.dominant_class_id if summary.dominant_class_id is not None else 0
+        summary.dominant_final_class_id if summary.dominant_final_class_id is not None else 0
         for summary in usable
     ]
 
