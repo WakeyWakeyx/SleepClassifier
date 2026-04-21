@@ -142,5 +142,10 @@ def main() -> None:
     logger.info("Predicted class counts:\n%s", prediction_frame["predicted_class_name"].value_counts())
 
 
+from sleep_classifier.epoch_inference import main as epoch_main
+
+main = epoch_main
+
+
 if __name__ == "__main__":
-    main()
+    epoch_main()
