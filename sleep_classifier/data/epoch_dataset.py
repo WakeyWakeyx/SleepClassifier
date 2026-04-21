@@ -426,9 +426,20 @@ def _load_or_compute_transition_stats(
     transition_counts = np.ones((len(FINAL_ID_TO_NAME), len(FINAL_ID_TO_NAME)), dtype=np.float64)
     for _, participant_frame in train_manifest.groupby("participant_id", sort=False):
         labels = participant_frame["final_label_id"].to_numpy(dtype=np.int64)
+        epochs = participant_frame["center_epoch_index"].to_numpy(dtype=np.int64)
+        strides = participant_frame["stride_epochs"].to_numpy(dtype=np.int64)
         if len(labels) < 2:
             continue
-        for previous_label, next_label in zip(labels[:-1], labels[1:], strict=False):
+        for previous_label, next_label, previous_epoch, next_epoch, previous_stride in zip(
+            labels[:-1],
+            labels[1:],
+            epochs[:-1],
+            epochs[1:],
+            strides[:-1],
+            strict=False,
+        ):
+            if int(next_epoch) - int(previous_epoch) != int(previous_stride):
+                continue
             transition_counts[int(previous_label), int(next_label)] += 1.0
 
     priors = np.bincount(
