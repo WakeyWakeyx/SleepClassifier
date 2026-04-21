@@ -191,7 +191,7 @@ def main() -> None:
     logger.info("Saved confusion matrix plot to %s.", confusion_path)
 
 
-from sleep_classifier.standalone_evaluation import main as evaluation_main
+from sleep_classifier.epoch_standalone_evaluation import main as evaluation_main
 
 main = evaluation_main
 
