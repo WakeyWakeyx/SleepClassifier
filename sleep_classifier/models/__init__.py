@@ -1,5 +1,12 @@
 """Model package."""
 
-from .cnn1d import SleepStageCNN1D
+from .hybrid import MultiScaleResidualBiLSTMClassifier, SleepStageContextModel, build_model
 
-__all__ = ["SleepStageCNN1D"]
+SleepStageCNN1D = SleepStageContextModel
+
+__all__ = [
+    "MultiScaleResidualBiLSTMClassifier",
+    "SleepStageContextModel",
+    "SleepStageCNN1D",
+    "build_model",
+]
