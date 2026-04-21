@@ -7,7 +7,7 @@ import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -25,6 +25,7 @@ LABEL_NAMES: tuple[str, ...] = ("W", "N1", "N2", "N3", "R")
 EXCLUDED_LABELS: tuple[str, ...] = ("P", "Missing")
 MINORITY_LABELS: tuple[str, ...] = ("N1", "N3", "R")
 TRANSITION_DISTANCE_THRESHOLDS: tuple[int, ...] = (128, 256, 512, 1024)
+LABEL_SCHEMA_NAME = "five_class"
 
 # Core sequence-window defaults. Each supervised example is one contiguous
 # multichannel time series, and the label is assigned from the target segment only.
@@ -80,6 +81,42 @@ COLLAPSE_PATIENCE_EPOCHS = 2
 PARTICIPANT_BALANCED_SAMPLING = False
 AUXILIARY_TARGET_LOSS_WEIGHT = 0.0
 WARMUP_EPOCHS = 0
+
+
+def _default_label_mapping() -> dict[str, str]:
+    """Return the default identity mapping from source stages to supervised stages."""
+
+    return {label_name: label_name for label_name in LABEL_NAMES}
+
+
+def _ordered_unique(values: Sequence[str]) -> tuple[str, ...]:
+    """Preserve first-seen order while removing duplicates."""
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            ordered.append(value)
+    return tuple(ordered)
+
+
+def _derive_label_names(
+    source_label_names: Sequence[str],
+    label_mapping: Mapping[str, str],
+) -> tuple[str, ...]:
+    """Build the supervised label order from the configured source-stage mapping."""
+
+    return _ordered_unique(label_mapping[source_label] for source_label in source_label_names)
+
+
+def _remap_focus_labels(
+    focus_labels: Sequence[str],
+    label_mapping: Mapping[str, str],
+) -> tuple[str, ...]:
+    """Remap raw or already-remapped focus labels into supervised label space."""
+
+    return _ordered_unique(label_mapping.get(label_name, label_name) for label_name in focus_labels)
 
 
 def _default_dataset_dir() -> Path:
@@ -179,7 +216,10 @@ class DataConfig:
     timestamp_column: str = "TIMESTAMP"
     target_column: str = "Sleep_Stage"
     feature_columns: tuple[str, ...] = FEATURE_COLUMNS
+    label_schema_name: str = LABEL_SCHEMA_NAME
+    source_label_names: tuple[str, ...] = LABEL_NAMES
     label_names: tuple[str, ...] = LABEL_NAMES
+    label_mapping: dict[str, str] = field(default_factory=_default_label_mapping)
     excluded_labels: tuple[str, ...] = EXCLUDED_LABELS
     target_window_length: int = TARGET_WINDOW_LENGTH
     step: int = STEP
@@ -249,6 +289,43 @@ class DataConfig:
         """Alias for concise references in diagnostics and summaries."""
 
         return self.label_purity_threshold
+
+    @property
+    def source_label_to_index(self) -> dict[str, int]:
+        """Map raw dataset sleep-stage labels to stable integer ids."""
+
+        return {
+            label_name: index
+            for index, label_name in enumerate(self.source_label_names)
+        }
+
+    @property
+    def source_index_to_label(self) -> dict[int, str]:
+        """Inverse mapping for raw dataset sleep-stage labels."""
+
+        return {
+            index: label_name
+            for index, label_name in enumerate(self.source_label_names)
+        }
+
+    @property
+    def output_label_to_index(self) -> dict[str, int]:
+        """Map supervised output labels to stable integer ids."""
+
+        return {
+            label_name: index
+            for index, label_name in enumerate(self.label_names)
+        }
+
+    @property
+    def source_label_remap_indices(self) -> tuple[int, ...]:
+        """Map each raw-label index onto the configured supervised-label index."""
+
+        output_label_to_index = self.output_label_to_index
+        return tuple(
+            output_label_to_index[self.label_mapping[label_name]]
+            for label_name in self.source_label_names
+        )
 
 
 @dataclass(slots=True, frozen=True)
@@ -408,6 +485,14 @@ class ProjectConfig:
     def index_to_label(self) -> dict[int, str]:
         return {index: label for index, label in enumerate(self.data.label_names)}
 
+    @property
+    def source_label_to_index(self) -> dict[str, int]:
+        return self.data.source_label_to_index
+
+    @property
+    def source_index_to_label(self) -> dict[int, str]:
+        return self.data.source_index_to_label
+
 
 EXPERIMENT_PRESETS: dict[str, dict[str, Any]] = {
     "baseline_current": {
@@ -437,6 +522,28 @@ EXPERIMENT_PRESETS: dict[str, dict[str, Any]] = {
             "class_weighting_mode": "sqrt_inverse_frequency",
             "scheduler_name": "reduce_on_plateau",
             "early_stopping_metric": "macro_f1",
+        },
+    },
+    "baseline_current_ternary": {
+        "_extends": "baseline_current",
+        "experiment": {
+            "notes": (
+                "Current baseline with the existing split/window/context pipeline preserved, "
+                "but remapped into Awake/Light/Deep through the config-driven label schema."
+            ),
+        },
+        "data": {
+            "label_schema_name": "ternary_sleep_depth",
+            "label_mapping": {
+                "W": "Awake",
+                "N1": "Light",
+                "N2": "Light",
+                "N3": "Deep",
+                "R": "Deep",
+            },
+        },
+        "training": {
+            "minority_labels": ("Light", "Deep"),
         },
     },
     "target_only_cnn_centered": {
@@ -781,6 +888,33 @@ def _default_config_payload() -> dict[str, Any]:
     }
 
 
+def _resolve_preset_payload(
+    preset_name: str,
+    ancestry: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Resolve one preset, optionally inheriting from another preset."""
+
+    if preset_name in ancestry:
+        cycle = " -> ".join([*ancestry, preset_name])
+        raise ValueError(f"Preset inheritance cycle detected: {cycle}")
+    if preset_name not in EXPERIMENT_PRESETS:
+        known_presets = ", ".join(sorted(EXPERIMENT_PRESETS))
+        raise ValueError(
+            f"Unknown experiment preset '{preset_name}'. Known presets: {known_presets}"
+        )
+
+    preset_payload = dict(EXPERIMENT_PRESETS[preset_name])
+    parent_preset_name = preset_payload.pop("_extends", None)
+    if parent_preset_name is None:
+        return preset_payload
+
+    inherited_payload = _resolve_preset_payload(
+        parent_preset_name,
+        ancestry=(*ancestry, preset_name),
+    )
+    return _deep_merge(inherited_payload, preset_payload)
+
+
 def _build_paths(experiment: ExperimentConfig) -> PathConfig:
     """Derive run-specific output locations for one experiment."""
 
@@ -827,7 +961,20 @@ def _normalize_payload(payload: dict[str, Any], preset_name: str) -> dict[str, A
 
     training_payload = payload["training"]
     data_payload = payload["data"]
+    model_payload = payload["model"]
     experiment_payload = payload["experiment"]
+
+    data_payload["source_label_names"] = tuple(data_payload["source_label_names"])
+    data_payload["label_mapping"] = dict(data_payload["label_mapping"])
+    data_payload["label_names"] = _derive_label_names(
+        source_label_names=data_payload["source_label_names"],
+        label_mapping=data_payload["label_mapping"],
+    )
+    model_payload["num_classes"] = len(data_payload["label_names"])
+    training_payload["minority_labels"] = _remap_focus_labels(
+        focus_labels=tuple(training_payload["minority_labels"]),
+        label_mapping=data_payload["label_mapping"],
+    )
 
     sampler_strategy = training_payload.get("sampler_strategy")
     if sampler_strategy is None:
@@ -889,7 +1036,7 @@ def build_configs() -> list[ProjectConfig]:
             )
 
         payload = _default_config_payload()
-        payload = _deep_merge(payload, EXPERIMENT_PRESETS[preset_name])
+        payload = _deep_merge(payload, _resolve_preset_payload(preset_name))
         payload = _deep_merge(payload, overrides)
         payload["experiment"]["preset_name"] = preset_name
         payload["experiment"].setdefault("name", preset_name)
@@ -933,6 +1080,46 @@ def _validate_config(config: ProjectConfig) -> None:
     if config.model.num_classes != len(config.data.label_names):
         raise ValueError(
             "Model num_classes must match the number of configured label names."
+        )
+    if not config.data.label_schema_name:
+        raise ValueError("label_schema_name must be a non-empty string.")
+    if not config.data.source_label_names:
+        raise ValueError("source_label_names must contain at least one dataset label.")
+    if not config.data.label_names:
+        raise ValueError("label_names must contain at least one supervised label.")
+    if len(set(config.data.source_label_names)) != len(config.data.source_label_names):
+        raise ValueError("source_label_names must be unique.")
+    if len(set(config.data.label_names)) != len(config.data.label_names):
+        raise ValueError("label_names must be unique.")
+    if set(config.data.excluded_labels) & set(config.data.source_label_names):
+        raise ValueError("excluded_labels cannot overlap source_label_names.")
+    missing_mapping_keys = sorted(
+        set(config.data.source_label_names) - set(config.data.label_mapping)
+    )
+    if missing_mapping_keys:
+        raise ValueError(
+            "label_mapping must define every source label. Missing: "
+            + ", ".join(missing_mapping_keys)
+        )
+    unknown_mapping_keys = sorted(
+        set(config.data.label_mapping) - set(config.data.source_label_names)
+    )
+    if unknown_mapping_keys:
+        raise ValueError(
+            "label_mapping contains unknown source labels: "
+            + ", ".join(unknown_mapping_keys)
+        )
+    unknown_supervised_labels = sorted(
+        set(config.data.label_mapping.values()) - set(config.data.label_names)
+    )
+    if unknown_supervised_labels:
+        raise ValueError(
+            "label_mapping contains unknown supervised labels: "
+            + ", ".join(unknown_supervised_labels)
+        )
+    if set(config.data.label_names) != set(config.data.label_mapping.values()):
+        raise ValueError(
+            "label_names must exactly match the supervised labels produced by label_mapping."
         )
     if config.model.model_name not in {
         "cnn_baseline",
