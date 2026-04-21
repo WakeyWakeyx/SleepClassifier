@@ -1,10 +1,11 @@
 """Model package."""
 
-from .hybrid import MultiScaleResidualBiLSTMClassifier, SleepStageContextModel, build_model
+from .epoch_sequence import ModalityAwareEpochSequenceModel, SleepStageCNN1D, SleepStageContextModel, build_model
 
-SleepStageCNN1D = SleepStageContextModel
+MultiScaleResidualBiLSTMClassifier = ModalityAwareEpochSequenceModel
 
 __all__ = [
+    "ModalityAwareEpochSequenceModel",
     "MultiScaleResidualBiLSTMClassifier",
     "SleepStageContextModel",
     "SleepStageCNN1D",
