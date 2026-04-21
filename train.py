@@ -373,17 +373,11 @@ def run_training(
     logger.info("Training complete. Best validation macro F1: %.4f", best_val_macro_f1)
 
 
-def main() -> None:
-    parser = build_parser()
-    args = parser.parse_args()
-    logger = build_logger()
-    config = initialize_config(args, logger)
-    run_training(
-        config=config,
-        resume_from=args.resume_from,
-        best_checkpoint_filename=args.checkpoint_name,
-    )
+from sleep_classifier.training_pipeline import main as pipeline_main, run_training as pipeline_run_training
+
+main = pipeline_main
+run_training = pipeline_run_training
 
 
 if __name__ == "__main__":
-    main()
+    pipeline_main()
