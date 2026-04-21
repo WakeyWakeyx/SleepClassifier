@@ -64,7 +64,7 @@ def clean_participant_frame(
 
     frame = frame.sort_values(data_config.timestamp_column, kind="stable").reset_index(drop=True)
 
-    allowed_labels = set(data_config.label_names) | set(data_config.excluded_labels)
+    allowed_labels = set(data_config.source_label_names) | set(data_config.excluded_labels)
     labels = (
         frame[data_config.target_column]
         .astype("string")
