@@ -373,7 +373,7 @@ def run_training(
     logger.info("Training complete. Best validation macro F1: %.4f", best_val_macro_f1)
 
 
-from sleep_classifier.training_pipeline import main as pipeline_main, run_training as pipeline_run_training
+from sleep_classifier.epoch_training_pipeline import main as pipeline_main, run_training as pipeline_run_training
 
 main = pipeline_main
 run_training = pipeline_run_training
