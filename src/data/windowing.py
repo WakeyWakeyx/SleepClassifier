@@ -116,9 +116,11 @@ class WindowedSleepDataset(Dataset[WindowSample]):
         self.left_context = data_config.effective_left_context
         self.right_context = data_config.effective_right_context
         self.input_window_length = data_config.input_window_length
-        self.label_names = tuple(
-            label_name
-            for label_name, _ in sorted(label_to_index.items(), key=lambda item: item[1])
+        self.label_names = tuple(data_config.label_names)
+        self.source_label_names = tuple(data_config.source_label_names)
+        source_label_remap_indices = np.asarray(
+            data_config.source_label_remap_indices,
+            dtype=np.int64,
         )
         self.samples: list[WindowMetadata] = []
         label_buffer: list[int] = []
@@ -174,6 +176,7 @@ class WindowedSleepDataset(Dataset[WindowSample]):
                 encoded_labels=encoded_labels,
                 timestamps=timestamp_array,
                 data_config=data_config,
+                source_label_remap_indices=source_label_remap_indices,
                 label_names=self.label_names,
             )
             self.samples.extend(participant_windows)
@@ -290,6 +293,7 @@ class WindowedSleepDataset(Dataset[WindowSample]):
                 label_names=self.label_names,
             ),
             "sequence_definition": _build_sequence_definition(data_config),
+            "label_schema": _build_label_schema_summary(data_config),
             "participant_summaries": self.participant_summaries,
         }
 
@@ -369,6 +373,7 @@ def _generate_windows_for_participant(
     encoded_labels: np.ndarray,
     timestamps: np.ndarray,
     data_config: DataConfig,
+    source_label_remap_indices: np.ndarray,
     label_names: Sequence[str],
 ) -> tuple[list[WindowMetadata], ParticipantWindowReport, TransitionDiagnostics]:
     """Create sequence windows and target labels for one participant.
@@ -417,6 +422,7 @@ def _generate_windows_for_participant(
     valid_prefix = np.concatenate(
         [np.array([0], dtype=np.int64), np.cumsum(encoded_labels >= 0, dtype=np.int64)]
     )
+    num_source_labels = int(source_label_remap_indices.shape[0])
     class_prefixes = [
         np.concatenate(
             [
@@ -424,13 +430,17 @@ def _generate_windows_for_participant(
                 np.cumsum(encoded_labels == class_index, dtype=np.int64),
             ]
         )
-        for class_index in range(len(label_names))
+        for class_index in range(num_source_labels)
     ]
     gap_prefix = _build_gap_prefix(
         timestamps=timestamps,
         continuity_gap_factor=data_config.continuity_gap_factor,
     )
-    transition_change_points = np.flatnonzero(encoded_labels[1:] != encoded_labels[:-1]) + 1
+    remapped_labels = _remap_encoded_labels(
+        encoded_labels=encoded_labels,
+        source_label_remap_indices=source_label_remap_indices,
+    )
+    transition_change_points = np.flatnonzero(remapped_labels[1:] != remapped_labels[:-1]) + 1
     transition_change_points_list = transition_change_points.tolist()
 
     min_valid_count = math.ceil(
@@ -486,22 +496,32 @@ def _generate_windows_for_participant(
             data_config=data_config,
         )
         if assignment.candidate_label_index is not None:
-            candidate_label_counts[assignment.candidate_label_index] += 1
+            candidate_label_counts[
+                int(source_label_remap_indices[assignment.candidate_label_index])
+            ] += 1
         if assignment.is_ambiguous and assignment.purity_reference_label_index is not None:
-            purity_threshold_failures_by_class[assignment.purity_reference_label_index] += 1
+            purity_threshold_failures_by_class[
+                int(source_label_remap_indices[assignment.purity_reference_label_index])
+            ] += 1
         if assignment.discard_reason is not None:
             discard_reasons[assignment.discard_reason] += 1
             if assignment.discard_reason == "insufficient_purity":
                 if assignment.purity_reference_label_index is not None:
-                    actual_purity_discards_by_class[assignment.purity_reference_label_index] += 1
+                    actual_purity_discards_by_class[
+                        int(source_label_remap_indices[assignment.purity_reference_label_index])
+                    ] += 1
             if assignment.candidate_label_index is not None:
                 discarded_class_counts_by_reason.setdefault(
                     assignment.discard_reason,
                     Counter(),
-                )[assignment.candidate_label_index] += 1
+                )[
+                    int(source_label_remap_indices[assignment.candidate_label_index])
+                ] += 1
             continue
         if assignment.is_ambiguous:
             ambiguous_windows_kept += 1
+
+        remapped_label_index = int(source_label_remap_indices[int(assignment.label_index)])
 
         windows.append(
             WindowMetadata(
@@ -510,7 +530,7 @@ def _generate_windows_for_participant(
                 input_end_index=input_end_index,
                 target_start_index=target_start_index,
                 target_end_index=target_end_index,
-                label_index=int(assignment.label_index),
+                label_index=remapped_label_index,
             )
         )
         target_center_index = target_start_index + (data_config.target_window_length // 2)
@@ -518,12 +538,12 @@ def _generate_windows_for_participant(
             change_points=transition_change_points_list,
             reference_index=target_center_index,
         )
-        transition_distances_by_class[int(assignment.label_index)].append(
+        transition_distances_by_class[remapped_label_index].append(
             nearest_transition_distance
         )
         for threshold in data_config.transition_distance_thresholds:
             if nearest_transition_distance <= threshold:
-                transition_counts_within_threshold[threshold][int(assignment.label_index)] += 1
+                transition_counts_within_threshold[threshold][remapped_label_index] += 1
 
     kept_label_counts = Counter(window.label_index for window in windows)
     report = ParticipantWindowReport(
@@ -700,6 +720,22 @@ def _build_gap_prefix(
     return np.concatenate([np.array([0], dtype=np.int64), np.cumsum(bad_boundaries)])
 
 
+def _remap_encoded_labels(
+    encoded_labels: np.ndarray,
+    source_label_remap_indices: np.ndarray,
+) -> np.ndarray:
+    """Map raw encoded labels into the configured supervised label space."""
+
+    remapped = np.full(shape=encoded_labels.shape, fill_value=-1, dtype=np.int16)
+    valid_mask = encoded_labels >= 0
+    if np.any(valid_mask):
+        remapped[valid_mask] = source_label_remap_indices[encoded_labels[valid_mask]].astype(
+            np.int16,
+            copy=False,
+        )
+    return remapped
+
+
 def _window_crosses_gap(gap_prefix: np.ndarray, start_index: int, end_index: int) -> bool:
     """Return True when a contiguous input span crosses a detected timestamp gap."""
 
@@ -726,6 +762,17 @@ def _build_sequence_definition(
         "total_input_length": data_config.input_window_length,
         "step": data_config.step,
         "transition_distance_thresholds": list(data_config.transition_distance_thresholds),
+    }
+
+
+def _build_label_schema_summary(data_config: DataConfig) -> dict[str, Any]:
+    """Serialize the configured raw-to-supervised label schema."""
+
+    return {
+        "label_schema_name": data_config.label_schema_name,
+        "source_label_names": list(data_config.source_label_names),
+        "label_names": list(data_config.label_names),
+        "label_mapping": dict(data_config.label_mapping),
     }
 
 
