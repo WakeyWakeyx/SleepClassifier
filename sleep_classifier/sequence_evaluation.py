@@ -149,6 +149,8 @@ def smooth_predictions(
 
     if config.smoothing_mode == "none":
         return None
+    if config.smoothing_mode == "viterbi" and (transition_matrix is None or class_priors is None):
+        return None
 
     grouped_indices = _group_sequence_indices(metadata)
     smoothed_predictions = raw_predictions.copy()
