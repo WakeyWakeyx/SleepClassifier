@@ -16,7 +16,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=2, help="Short debug epoch count.")
     parser.add_argument("--batch-size", type=int, default=16, help="Debug batch size.")
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers. Defaults to 0 for Windows.")
-    parser.add_argument("--stride-seconds", type=int, default=30, help="Window stride in seconds.")
+    parser.add_argument("--context-window-seconds", type=int, default=90, help="Total context window in seconds.")
+    parser.add_argument("--train-stride-seconds", type=int, default=15, help="Training stride in seconds.")
     return parser
 
 
@@ -28,7 +29,8 @@ def main() -> None:
         epochs=args.epochs,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        stride_seconds=args.stride_seconds,
+        context_window_seconds=args.context_window_seconds,
+        train_stride_seconds=args.train_stride_seconds,
         limit_files=10,
         early_stopping_patience=2,
     )
