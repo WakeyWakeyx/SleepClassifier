@@ -263,7 +263,7 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
     train_dataset = _build_windowed_dataset(
         train_participants,
         data_config=config.data,
-        label_to_index=config.label_to_index,
+        label_to_index=config.source_label_to_index,
         split_name="train",
         logger=logger,
     )
@@ -343,9 +343,24 @@ def run_training_pipeline(config: ProjectConfig) -> dict[str, Any]:
         len(test_dataset),
     )
 
-    _log_window_summary(logger, "Train", train_dataset)
-    _log_window_summary(logger, "Validation", val_dataset)
-    _log_window_summary(logger, "Test", test_dataset)
+    _log_window_summary(
+        logger,
+        "Train",
+        train_dataset,
+        focus_labels=config.training.minority_labels,
+    )
+    _log_window_summary(
+        logger,
+        "Validation",
+        val_dataset,
+        focus_labels=config.training.minority_labels,
+    )
+    _log_window_summary(
+        logger,
+        "Test",
+        test_dataset,
+        focus_labels=config.training.minority_labels,
+    )
 
     class_counts = _compute_class_counts(
         labels=train_dataset.labels,
@@ -922,7 +937,7 @@ def _load_normalize_and_window_split(
     dataset = _build_windowed_dataset(
         participants,
         data_config=config.data,
-        label_to_index=config.label_to_index,
+        label_to_index=config.source_label_to_index,
         split_name=split_name,
         logger=logger,
     )
@@ -1700,10 +1715,16 @@ def _log_window_summary(
     logger: logging.Logger,
     split_name: str,
     dataset: WindowedSleepDataset,
+    focus_labels: Sequence[str] | None = None,
 ) -> None:
     """Log concise split-level window generation diagnostics."""
 
     sequence_definition = dataset.summary["sequence_definition"]
+    resolved_focus_labels = tuple(
+        label_name
+        for label_name in (focus_labels or ())
+        if label_name in dataset.label_names
+    )
     if sequence_definition["use_context_windows"]:
         logger.info(
             (
@@ -1760,28 +1781,31 @@ def _log_window_summary(
             _format_named_values(dataset.summary["purity_threshold_failure_rates_by_class"], digits=3),
         )
         purity_relative_loss = dataset.summary.get("minority_purity_relative_loss", {})
-        if purity_relative_loss:
+        if purity_relative_loss and resolved_focus_labels:
             logger.info(
-                "%s purity pressure vs overall | N1=%.2fx | N3=%.2fx | R=%.2fx",
+                "%s focus-label purity pressure vs overall | %s",
                 split_name,
-                purity_relative_loss.get("N1", {}).get("relative_to_overall", 0.0),
-                purity_relative_loss.get("N3", {}).get("relative_to_overall", 0.0),
-                purity_relative_loss.get("R", {}).get("relative_to_overall", 0.0),
+                " | ".join(
+                    (
+                        f"{label_name}="
+                        f"{purity_relative_loss.get(label_name, {}).get('relative_to_overall', 0.0):.2f}x"
+                    )
+                    for label_name in resolved_focus_labels
+                ),
             )
     participant_coverage = dataset.summary.get("participant_class_coverage", {})
-    if participant_coverage:
+    if participant_coverage and resolved_focus_labels:
         logger.info(
-            (
-                "%s participant coverage | "
-                "N1_nonzero=%d top5=%.2f | N3_nonzero=%d top5=%.2f | R_nonzero=%d top5=%.2f"
-            ),
+            "%s focus-label participant coverage | %s",
             split_name,
-            participant_coverage.get("N1", {}).get("participants_with_any", 0),
-            participant_coverage.get("N1", {}).get("top5_share", 0.0),
-            participant_coverage.get("N3", {}).get("participants_with_any", 0),
-            participant_coverage.get("N3", {}).get("top5_share", 0.0),
-            participant_coverage.get("R", {}).get("participants_with_any", 0),
-            participant_coverage.get("R", {}).get("top5_share", 0.0),
+            " | ".join(
+                (
+                    f"{label_name}_nonzero="
+                    f"{participant_coverage.get(label_name, {}).get('participants_with_any', 0)} "
+                    f"top5={participant_coverage.get(label_name, {}).get('top5_share', 0.0):.2f}"
+                )
+                for label_name in resolved_focus_labels
+            ),
         )
     transition_proximity = dataset.summary.get("transition_proximity_by_class", {})
     if transition_proximity:
@@ -1808,6 +1832,17 @@ def _log_sequence_configuration(
     """Log how each supervised sequence sample is constructed."""
 
     logger.info(
+        "Label schema | name=%s | supervised_labels=%s | mapping=%s",
+        data_config.label_schema_name,
+        ", ".join(data_config.label_names),
+        ", ".join(
+            (
+                f"{source_label}->{data_config.label_mapping[source_label]}"
+                for source_label in data_config.source_label_names
+            )
+        ),
+    )
+    logger.info(
         (
             "Sequence windowing | target_length=%d | left_context=%d | "
             "right_context=%d | total_input_length=%d | step=%d | use_context_windows=%s | "
@@ -1827,10 +1862,14 @@ def _log_sequence_configuration(
 
 def _build_windowing_config_summary(
     data_config: DataConfig,
-) -> dict[str, int | float | bool | str]:
+) -> dict[str, Any]:
     """Serialize the sequence windowing configuration saved with artifacts."""
 
     return {
+        "label_schema_name": data_config.label_schema_name,
+        "source_label_names": list(data_config.source_label_names),
+        "label_names": list(data_config.label_names),
+        "label_mapping": dict(data_config.label_mapping),
         "target_window_length": data_config.target_window_length,
         "step": data_config.step,
         "use_context_windows": data_config.use_context_windows,
