@@ -381,3 +381,9 @@ def apply_common_overrides(config: ExperimentConfig, args: Any) -> ExperimentCon
     if getattr(args, "lr_scheduler_metric", None) is not None:
         config.lr_scheduler_metric = str(args.lr_scheduler_metric)
     return config
+
+
+from sleep_classifier.experiment_config import ExperimentConfig as EpochExperimentConfig, apply_common_overrides as apply_epoch_common_overrides
+
+ExperimentConfig = EpochExperimentConfig
+apply_common_overrides = apply_epoch_common_overrides
