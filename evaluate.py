@@ -191,5 +191,10 @@ def main() -> None:
     logger.info("Saved confusion matrix plot to %s.", confusion_path)
 
 
+from sleep_classifier.standalone_evaluation import main as evaluation_main
+
+main = evaluation_main
+
+
 if __name__ == "__main__":
-    main()
+    evaluation_main()
