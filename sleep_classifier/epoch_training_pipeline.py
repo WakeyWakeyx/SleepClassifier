@@ -16,7 +16,13 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import WeightedRandomSampler
 
-from sleep_classifier.data import PreparedDataBundle, SleepWindowDataset, prepare_datasets
+from sleep_classifier.data import (
+    EpochSequenceDataset,
+    PreparedDataBundle,
+    PreparedSplitData,
+    SleepWindowDataset,
+    prepare_datasets,
+)
 from sleep_classifier.experiment_config import ExperimentConfig, apply_common_overrides
 from sleep_classifier.label_mapping import get_class_names
 from sleep_classifier.models import build_model
@@ -125,7 +131,10 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_train_sampler(dataset: SleepWindowDataset, class_weights: list[float]) -> WeightedRandomSampler:
+def build_train_sampler(
+    dataset: EpochSequenceDataset | SleepWindowDataset,
+    class_weights: list[float],
+) -> WeightedRandomSampler:
     """Create a weighted random sampler for the training split."""
 
     labels = dataset.labels.cpu().numpy()
