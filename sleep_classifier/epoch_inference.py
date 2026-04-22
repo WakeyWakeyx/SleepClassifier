@@ -20,7 +20,7 @@ from sleep_classifier.experiment_config import ExperimentConfig, apply_common_ov
 from sleep_classifier.label_mapping import FINAL_ID_TO_NAME, get_class_names
 from sleep_classifier.models import build_model
 from sleep_classifier.sequence_evaluation import smooth_predictions
-from sleep_classifier.utils import build_logger, configure_torch_runtime, get_device
+from sleep_classifier.utils import build_logger, configure_torch_runtime, get_device, load_torch_checkpoint
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -42,9 +42,10 @@ def build_parser() -> argparse.ArgumentParser:
 def initialize_config(checkpoint_path: Path, args: argparse.Namespace) -> tuple[ExperimentConfig, dict]:
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = load_torch_checkpoint(checkpoint_path, map_location="cpu")
     config = ExperimentConfig.from_dict(checkpoint["config"])
     config = apply_common_overrides(config, args)
+    config.validate()
     config.ensure_output_dirs()
     return config, checkpoint
 
@@ -58,9 +59,19 @@ def normalize_features(
     if normalization_stats.get("mode") == "participant":
         participant_stats = normalization_stats.get("participants", {}).get(participant_id)
         if participant_stats is None:
+            channel_count = participant_features.shape[1]
+            sums = np.zeros(channel_count, dtype=np.float64)
+            squared_sums = np.zeros(channel_count, dtype=np.float64)
+            count = int(participant_features.shape[0] * participant_features.shape[2])
+            for channel_index in range(channel_count):
+                channel_values = np.asarray(participant_features[:, channel_index, :], dtype=np.float64)
+                sums[channel_index] += channel_values.sum(dtype=np.float64)
+                squared_sums[channel_index] += np.square(channel_values).sum(dtype=np.float64)
+            means = sums / count
+            variances = np.maximum((squared_sums / count) - np.square(means), 1e-12)
             participant_stats = {
-                "mean": participant_features.mean(axis=0, dtype=np.float64).tolist(),
-                "std": np.maximum(participant_features.std(axis=0, dtype=np.float64), 1e-6).tolist(),
+                "mean": means.tolist(),
+                "std": np.sqrt(variances).tolist(),
             }
         mean = np.asarray(participant_stats["mean"], dtype=np.float32).reshape(1, -1, 1)
         std = np.asarray(participant_stats["std"], dtype=np.float32).reshape(1, -1, 1)
@@ -125,9 +136,9 @@ def main() -> None:
         dataset,
         batch_size=config.batch_size,
         shuffle=False,
-        num_workers=config.num_workers,
-        pin_memory=device.type == "cuda",
-        persistent_workers=config.num_workers > 0,
+        num_workers=0,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=False,
     )
 
     model = build_model(
