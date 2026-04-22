@@ -34,6 +34,7 @@ from sleep_classifier.utils import (
     elapsed_seconds,
     format_seconds,
     get_device,
+    load_torch_checkpoint,
     plot_training_history,
     save_json,
     set_global_seed,
@@ -283,7 +284,7 @@ def load_checkpoint_state(
 ) -> tuple[int, float, dict[str, list[float]]]:
     """Restore training state from a checkpoint."""
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = load_torch_checkpoint(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     scheduler_state = checkpoint.get("scheduler_state_dict")
@@ -305,7 +306,7 @@ def initialize_config(args: argparse.Namespace, logger: Any) -> ExperimentConfig
     if args.resume_from is not None:
         if not args.resume_from.exists():
             raise FileNotFoundError(f"Resume checkpoint not found: {args.resume_from}")
-        checkpoint = torch.load(args.resume_from, map_location="cpu")
+        checkpoint = load_torch_checkpoint(args.resume_from, map_location="cpu")
         config = ExperimentConfig.from_dict(checkpoint["config"])
         logger.info("Loaded base config from checkpoint %s.", args.resume_from)
     else:
@@ -531,7 +532,7 @@ def run_training(
             )
             break
 
-    best_checkpoint = torch.load(best_checkpoint_path, map_location=device)
+    best_checkpoint = load_torch_checkpoint(best_checkpoint_path, map_location=device)
     model.load_state_dict(best_checkpoint["model_state_dict"])
     logger.info("Reloaded best checkpoint from %s for final test evaluation.", best_checkpoint_path)
 
