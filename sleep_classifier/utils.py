@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import pickle
 import random
 from pathlib import Path
 from time import perf_counter
@@ -106,6 +107,17 @@ def load_json(path: Path) -> Any:
 
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def load_torch_checkpoint(path: Path, map_location: Any = "cpu") -> Any:
+    """Load a checkpoint, preferring weights-only deserialization when supported."""
+
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+    except pickle.UnpicklingError:
+        return torch.load(path, map_location=map_location)
 
 
 def time_block() -> float:
