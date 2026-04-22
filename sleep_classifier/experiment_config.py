@@ -16,6 +16,8 @@ FILTERED_FEATURE_COLUMNS: tuple[str, ...] = (
     "ACC_Z",
     "HR",
 )
+PARTICIPANT_CACHE_DIRNAME = "participants"
+LEGACY_PARTICIPANT_CACHE_DIRNAME = "cleaned_participants"
 DEFAULT_FEATURE_COLUMNS: tuple[str, ...] = FILTERED_FEATURE_COLUMNS
 DEFAULT_DERIVED_FEATURE_COLUMNS: tuple[str, ...] = ()
 DEFAULT_LABEL_COLUMN = "Sleep_Stage"
@@ -97,7 +99,7 @@ class ExperimentConfig:
     report_dirname: str = "reports"
     plot_dirname: str = "plots"
     cache_dirname: str = "cache"
-    cleaned_participant_dirname: str = "cleaned_participants"
+    cleaned_participant_dirname: str = PARTICIPANT_CACHE_DIRNAME
     history_filename: str = "training_history.json"
     config_filename: str = "config_snapshot.json"
     split_filename: str = "participant_splits.json"
@@ -243,6 +245,14 @@ class ExperimentConfig:
         return self.cache_dir / self.cleaned_participant_dirname
 
     @property
+    def participant_cache_dir(self) -> Path:
+        return self.cleaned_participants_dir
+
+    @property
+    def legacy_cleaned_participants_dir(self) -> Path:
+        return self.cache_dir / LEGACY_PARTICIPANT_CACHE_DIRNAME
+
+    @property
     def history_path(self) -> Path:
         return self.output_dir / self.history_filename
 
@@ -284,7 +294,7 @@ class ExperimentConfig:
         self.reports_dir.mkdir(parents=True, exist_ok=True)
         self.plots_dir.mkdir(parents=True, exist_ok=True)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.cleaned_participants_dir.mkdir(parents=True, exist_ok=True)
+        self.participant_cache_dir.mkdir(parents=True, exist_ok=True)
 
     def validate(self) -> None:
         ratios_sum = self.train_ratio + self.val_ratio + self.test_ratio
@@ -306,6 +316,16 @@ class ExperimentConfig:
             raise ValueError("epochs must be positive.")
         if self.num_workers < 0:
             raise ValueError("num_workers cannot be negative.")
+        if tuple(self.feature_columns) != FILTERED_FEATURE_COLUMNS:
+            raise ValueError(
+                "Epoch-sequence training only supports the canonical filtered feature order "
+                f"{list(FILTERED_FEATURE_COLUMNS)}."
+            )
+        if self.use_derived_features:
+            raise ValueError(
+                "Derived features are disabled for the epoch-sequence pipeline; "
+                "only TEMP, ACC_X, ACC_Y, ACC_Z, and HR may be used."
+            )
         if self.normalization_mode not in SUPPORTED_NORMALIZATION_MODES:
             raise ValueError(
                 f"Unsupported normalization mode '{self.normalization_mode}'. "
