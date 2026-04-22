@@ -9,23 +9,15 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_FEATURE_COLUMNS: tuple[str, ...] = (
-    "BVP",
-    "IBI",
-    "EDA",
+FILTERED_FEATURE_COLUMNS: tuple[str, ...] = (
     "TEMP",
     "ACC_X",
     "ACC_Y",
     "ACC_Z",
     "HR",
 )
-DEFAULT_DERIVED_FEATURE_COLUMNS: tuple[str, ...] = (
-    "ACC_MAG",
-    "BVP_DELTA",
-    "IBI_ROLLING_STD",
-    "EDA_SLOPE",
-    "TEMP_SLOPE",
-)
+DEFAULT_FEATURE_COLUMNS: tuple[str, ...] = FILTERED_FEATURE_COLUMNS
+DEFAULT_DERIVED_FEATURE_COLUMNS: tuple[str, ...] = ()
 DEFAULT_LABEL_COLUMN = "Sleep_Stage"
 DEFAULT_TIMESTAMP_COLUMN = "TIMESTAMP"
 DEFAULT_OUTPUT_DIR = Path("artifacts")
@@ -47,7 +39,7 @@ class ExperimentConfig:
     cache_version: str = "epoch_sequence_v2"
     feature_columns: tuple[str, ...] = DEFAULT_FEATURE_COLUMNS
     derived_feature_columns: tuple[str, ...] = DEFAULT_DERIVED_FEATURE_COLUMNS
-    use_derived_features: bool = True
+    use_derived_features: bool = False
     label_column: str = DEFAULT_LABEL_COLUMN
     timestamp_column: str = DEFAULT_TIMESTAMP_COLUMN
     sample_rate_hz: int = 64
