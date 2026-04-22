@@ -128,13 +128,18 @@ def load_and_clean_participant_csv(
 ) -> CachedParticipantData | None:
     """Load, validate, clean, and featurize a participant CSV."""
 
+    required_cols = (
+        config.timestamp_column,
+        *config.feature_columns,
+        config.label_column,
+    )
     try:
-        frame = pd.read_csv(file_path, low_memory=False)
+        frame = pd.read_csv(file_path, low_memory=False, usecols=required_cols)
     except Exception as exc:  # pragma: no cover - defensive runtime protection
         logger.warning("Skipping %s because it could not be read: %s", file_path.name, exc)
         return None
 
-    missing_columns = [column for column in config.required_columns if column not in frame.columns]
+    missing_columns = [column for column in required_cols if column not in frame.columns]
     if missing_columns:
         logger.warning(
             "Skipping %s because required columns are missing: %s",
