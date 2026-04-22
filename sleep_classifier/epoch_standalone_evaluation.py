@@ -14,7 +14,7 @@ from sleep_classifier.label_mapping import get_class_names
 from sleep_classifier.models import build_model
 from sleep_classifier.multitask_losses import build_loss
 from sleep_classifier.sequence_evaluation import evaluate_model
-from sleep_classifier.utils import build_logger, configure_torch_runtime, get_device, set_global_seed
+from sleep_classifier.utils import build_logger, configure_torch_runtime, get_device, load_torch_checkpoint, set_global_seed
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -54,7 +54,7 @@ def initialize_config(checkpoint_path: Path, args: argparse.Namespace, logger: A
 
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = load_torch_checkpoint(checkpoint_path, map_location="cpu")
     config = ExperimentConfig.from_dict(checkpoint["config"])
     config = apply_common_overrides(config, args)
     config.validate()
