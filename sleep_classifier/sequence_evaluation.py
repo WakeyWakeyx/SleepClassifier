@@ -12,7 +12,11 @@ from sklearn.metrics import classification_report
 from torch import nn
 from torch.utils.data import DataLoader
 
-from sleep_classifier.data.epoch_dataset import PreparedSplitData, SleepWindowDataset
+from sleep_classifier.data.epoch_dataset import (
+    EpochSequenceDataset,
+    PreparedSplitData,
+    SleepWindowDataset,
+)
 from sleep_classifier.experiment_config import ExperimentConfig
 from sleep_classifier.utils import compute_classification_metrics, plot_confusion_matrix, save_json
 
@@ -34,7 +38,7 @@ class EvaluationResult:
 
 
 def create_dataloader(
-    dataset: SleepWindowDataset,
+    dataset: EpochSequenceDataset | SleepWindowDataset,
     batch_size: int,
     num_workers: int,
     device: torch.device,
