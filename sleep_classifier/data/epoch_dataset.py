@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -15,11 +14,15 @@ from torch.utils.data import Dataset
 from sleep_classifier.experiment_config import ExperimentConfig
 from sleep_classifier.data.epoch_preprocessing import (
     CachedParticipantData,
+    ParticipantCachePaths,
     ParticipantSummary,
     build_window_manifest_rows,
-    extract_window_features,
+    cached_participant_is_compatible,
+    convert_legacy_cached_participant,
+    legacy_cached_participant_is_convertible,
     load_and_clean_participant_csv,
     load_cached_participant,
+    participant_cache_paths,
     participant_summary_from_dict,
     participant_summary_to_dict,
     save_cached_participant,
@@ -68,12 +71,12 @@ class PreparedDataBundle:
 
 
 class EpochSequenceDataset(Dataset[dict[str, torch.Tensor]]):
-    """Lazy dataset that loads per-participant windows on demand with memory mapping."""
+    """Lazy dataset that slices one memmapped participant window at a time."""
 
     def __init__(
         self,
         manifest: pd.DataFrame,
-        participant_cache_paths: dict[str, Path],
+        participant_cache_paths: dict[str, ParticipantCachePaths],
         normalization_stats: dict[str, Any],
         config: ExperimentConfig,
     ) -> None:
@@ -81,26 +84,68 @@ class EpochSequenceDataset(Dataset[dict[str, torch.Tensor]]):
         self.participant_cache_paths = dict(participant_cache_paths)
         self.normalization_stats = normalization_stats
         self.config = config
+
+        self.participant_ids = self.manifest["participant_id"].astype(str).tolist()
+        self.sequence_start_epochs = self.manifest["sequence_start_epoch"].to_numpy(dtype=np.int64)
+        self.center_epoch_indices = self.manifest["center_epoch_index"].to_numpy(dtype=np.int64)
+        self.raw_targets = self.manifest["raw_label_id"].to_numpy(dtype=np.int64)
+        self.final_targets = self.manifest["final_label_id"].to_numpy(dtype=np.int64)
+
         self._loaded_participants: dict[str, np.ndarray] = {}
-        self._loaded_labels: dict[str, np.ndarray] = {}
-        self._labels = torch.from_numpy(
-            self.manifest["final_label_id"].to_numpy(dtype=np.int64)
+        self._loaded_raw_labels: dict[str, np.ndarray] = {}
+        self._loaded_final_labels: dict[str, np.ndarray] = {}
+        self._participant_stats_cache: dict[str, dict[str, Any]] = {}
+        self._labels = torch.from_numpy(self.final_targets)
+
+    def _load_participant_arrays(
+        self,
+        participant_id: str,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if participant_id not in self._loaded_participants:
+            cache_paths = self.participant_cache_paths.get(participant_id)
+            if cache_paths is None:
+                raise KeyError(f"No cache paths for participant {participant_id}")
+            self._loaded_participants[participant_id] = np.load(cache_paths.features, mmap_mode="r")
+            self._loaded_raw_labels[participant_id] = np.load(cache_paths.raw_labels, mmap_mode="r")
+            self._loaded_final_labels[participant_id] = np.load(cache_paths.final_labels, mmap_mode="r")
+        return (
+            self._loaded_participants[participant_id],
+            self._loaded_raw_labels[participant_id],
+            self._loaded_final_labels[participant_id],
         )
 
-    def _load_participant_data(self, participant_id: str) -> np.ndarray:
-        if participant_id not in self._loaded_participants:
-            cache_path = self.participant_cache_paths.get(participant_id)
-            if cache_path is None:
-                raise KeyError(f"No cache path for participant {participant_id}")
-            data = np.load(cache_path, mmap_mode="r")
-            self._loaded_participants[participant_id] = data["features"]
-            self._loaded_labels[participant_id] = data["final_labels"]
-        return self._loaded_participants[participant_id]
+    def _compute_feature_stats(self, feature_tensor: np.ndarray) -> dict[str, list[float]]:
+        channel_count = feature_tensor.shape[1]
+        sums = np.zeros(channel_count, dtype=np.float64)
+        squared_sums = np.zeros(channel_count, dtype=np.float64)
+        count = int(feature_tensor.shape[0] * feature_tensor.shape[2])
+        if count <= 0:
+            raise ValueError("Cannot compute normalization statistics from an empty participant cache.")
+
+        for channel_index in range(channel_count):
+            channel_values = np.asarray(feature_tensor[:, channel_index, :], dtype=np.float64)
+            sums[channel_index] += channel_values.sum(dtype=np.float64)
+            squared_sums[channel_index] += np.square(channel_values).sum(dtype=np.float64)
+
+        means = sums / count
+        variances = np.maximum((squared_sums / count) - np.square(means), 1e-12)
+        return {
+            "mean": means.tolist(),
+            "std": np.sqrt(variances).tolist(),
+        }
 
     def _get_stats(self, participant_id: str) -> dict[str, Any]:
         if self.normalization_stats["mode"] == "global_train":
             return self.normalization_stats
-        return self.normalization_stats["participants"].get(participant_id, self.normalization_stats)
+
+        participant_stats = self.normalization_stats["participants"].get(participant_id)
+        if participant_stats is not None:
+            return participant_stats
+
+        if participant_id not in self._participant_stats_cache:
+            features, _, _ = self._load_participant_arrays(participant_id)
+            self._participant_stats_cache[participant_id] = self._compute_feature_stats(features)
+        return self._participant_stats_cache[participant_id]
 
     def _normalize(self, features: np.ndarray, stats: dict[str, Any]) -> np.ndarray:
         mean = np.asarray(stats["mean"], dtype=np.float32).reshape(1, -1, 1)
@@ -112,34 +157,35 @@ class EpochSequenceDataset(Dataset[dict[str, torch.Tensor]]):
         return self._labels
 
     def __len__(self) -> int:
-        return len(self.manifest)
+        return len(self.participant_ids)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        row = self.manifest.iloc[index]
-        participant_id = str(row["participant_id"])
+        participant_id = self.participant_ids[index]
+        features, raw_labels, final_labels = self._load_participant_arrays(participant_id)
 
-        features = self._load_participant_data(participant_id)
+        start_epoch = int(self.sequence_start_epochs[index])
+        end_epoch = start_epoch + self.config.context_length_epochs
+        center_epoch = int(self.center_epoch_indices[index])
 
-        start_idx = int(row["input_start_index"])
-        end_idx = int(row["input_end_index"])
-        window_data = features[start_idx:end_idx]
-
-        window_data = window_data.T.astype(np.float32, copy=False)
-
-        num_epochs = self.config.context_length_epochs
-        epoch_size = self.config.center_window_size
-        num_channels = window_data.shape[0]
-
-        reshaped = window_data.reshape(num_channels, num_epochs, epoch_size)
-        reshaped = np.transpose(reshaped, (1, 0, 2))
+        window_data = np.asarray(features[start_epoch:end_epoch], dtype=np.float32)
+        expected_shape = (
+            self.config.context_length_epochs,
+            len(self.config.input_feature_columns),
+            self.config.center_window_size,
+        )
+        if window_data.shape != expected_shape:
+            raise ValueError(
+                "Unexpected epoch window shape: "
+                f"expected {expected_shape}, got {window_data.shape} for participant {participant_id}"
+            )
 
         stats = self._get_stats(participant_id)
-        normalized = self._normalize(reshaped, stats)
+        normalized = self._normalize(window_data, stats).astype(np.float32, copy=False)
 
         return {
-            "features": torch.from_numpy(normalized.astype(np.float32, copy=False)),
-            "raw_target": torch.tensor(int(row["raw_label_id"]), dtype=torch.long),
-            "final_target": torch.tensor(int(row["final_label_id"]), dtype=torch.long),
+            "features": torch.from_numpy(normalized),
+            "raw_target": torch.tensor(int(raw_labels[center_epoch]), dtype=torch.long),
+            "final_target": torch.tensor(int(final_labels[center_epoch]), dtype=torch.long),
         }
 
 
@@ -171,33 +217,19 @@ class SleepWindowDataset(Dataset[dict[str, torch.Tensor]]):
 
 
 class ParticipantStore:
-    """Lazy participant cache backed by in-memory objects and saved npz files."""
+    """Lazy participant cache backed by per-participant memmapped arrays."""
 
-    def __init__(
-        self,
-        cache_paths: dict[str, Path],
-        initial_cache: dict[str, CachedParticipantData] | None = None,
-    ) -> None:
+    def __init__(self, cache_paths: dict[str, ParticipantCachePaths]) -> None:
         self.cache_paths = dict(cache_paths)
-        self._loaded = dict(initial_cache or {})
+        self._loaded: dict[str, CachedParticipantData] = {}
 
     def load(self, participant_id: str) -> CachedParticipantData:
         if participant_id not in self._loaded:
-            cache_path = self.cache_paths.get(participant_id)
-            if cache_path is None:
+            cache_paths = self.cache_paths.get(participant_id)
+            if cache_paths is None:
                 raise KeyError(f"No cached participant available for {participant_id}")
-            self._loaded[participant_id] = load_cached_participant(cache_path)
+            self._loaded[participant_id] = load_cached_participant(cache_paths, mmap_mode="r")
         return self._loaded[participant_id]
-
-
-def _normalize_features(features: np.ndarray, stats: dict[str, Any]) -> np.ndarray:
-    mean = np.asarray(stats["mean"], dtype=np.float32).reshape(1, -1, 1)
-    std = np.asarray(stats["std"], dtype=np.float32).reshape(1, -1, 1)
-    return (features - mean) / std
-
-
-def _participant_cache_path(config: ExperimentConfig, participant_id: str) -> Path:
-    return config.cleaned_participants_dir / f"{participant_id}.npz"
 
 
 def _load_existing_summary_lookup(config: ExperimentConfig) -> dict[str, ParticipantSummary]:
@@ -210,42 +242,81 @@ def _load_existing_summary_lookup(config: ExperimentConfig) -> dict[str, Partici
     }
 
 
+def _load_or_rebuild_participant_cache(
+    participant_file: ParticipantFile,
+    config: ExperimentConfig,
+    logger: logging.Logger,
+) -> tuple[CachedParticipantData | None, bool]:
+    participant_id = participant_file.participant_id
+    cache_paths = participant_cache_paths(config, participant_id)
+
+    if config.use_cache and not config.rebuild_cache and cached_participant_is_compatible(cache_paths, config):
+        return load_cached_participant(cache_paths, mmap_mode="r"), False
+
+    if config.use_cache and not config.rebuild_cache and legacy_cached_participant_is_convertible(cache_paths, config):
+        logger.info("Converting legacy cache for participant %s to memmapped epoch tensors.", participant_id)
+        return convert_legacy_cached_participant(cache_paths, config), True
+
+    if config.use_cache and not config.rebuild_cache:
+        has_existing_cache = any(
+            path.exists()
+            for path in (
+                cache_paths.features,
+                cache_paths.final_labels,
+                cache_paths.raw_labels,
+                cache_paths.metadata,
+                cache_paths.legacy_archive,
+            )
+        )
+        logger.info(
+            "%s participant cache for %s.",
+            "Rebuilding incompatible" if has_existing_cache else "Building",
+            participant_id,
+        )
+
+    cleaned = load_and_clean_participant_csv(
+        file_path=participant_file.file_path,
+        participant_id=participant_id,
+        config=config,
+        logger=logger,
+    )
+    if cleaned is None:
+        return None, False
+    save_cached_participant(cleaned, cache_paths)
+    return cleaned, True
+
+
 def _collect_participant_summaries(
     participant_files: list[ParticipantFile],
     config: ExperimentConfig,
     logger: logging.Logger,
-) -> tuple[list[ParticipantSummary], dict[str, ParticipantFile], ParticipantStore]:
+) -> tuple[list[ParticipantSummary], dict[str, ParticipantFile], ParticipantStore, bool]:
     summaries: list[ParticipantSummary] = []
     file_lookup: dict[str, ParticipantFile] = {}
-    in_memory_cache: dict[str, CachedParticipantData] = {}
-    cache_paths: dict[str, Path] = {}
+    cache_paths: dict[str, ParticipantCachePaths] = {}
     summary_lookup = _load_existing_summary_lookup(config)
     skipped_files = 0
+    artifacts_stale = bool(config.rebuild_cache)
 
-    logger.info("Using filtered columns: TEMP, ACC_X, ACC_Y, ACC_Z, HR")
+    logger.info("Using filtered columns: TEMP, ACC, HR")
+    logger.info("Canonical feature order: TEMP, ACC_X, ACC_Y, ACC_Z, HR")
     logger.info("Total channels after filtering: 5")
 
     for participant_file in participant_files:
         participant_id = participant_file.participant_id
         file_lookup[participant_id] = participant_file
-        cache_path = _participant_cache_path(config, participant_id)
-        cache_paths[participant_id] = cache_path
+        cache_paths[participant_id] = participant_cache_paths(config, participant_id)
 
         if (
             config.use_cache
             and not config.rebuild_cache
-            and cache_path.exists()
+            and cached_participant_is_compatible(cache_paths[participant_id], config)
             and participant_id in summary_lookup
         ):
             summaries.append(summary_lookup[participant_id])
             continue
 
-        cleaned = load_and_clean_participant_csv(
-            file_path=participant_file.file_path,
-            participant_id=participant_id,
-            config=config,
-            logger=logger,
-        )
+        cleaned, cache_rebuilt = _load_or_rebuild_participant_cache(participant_file, config, logger)
         if cleaned is None:
             skipped_files += 1
             continue
@@ -257,12 +328,11 @@ def _collect_participant_summaries(
                 participant_file.file_path.name,
             )
             skipped_files += 1
+            artifacts_stale = True
             continue
 
         summaries.append(summary)
-        in_memory_cache[participant_id] = cleaned
-        if config.use_cache:
-            save_cached_participant(cleaned, cache_path)
+        artifacts_stale = artifacts_stale or cache_rebuilt or participant_id not in summary_lookup
 
     if not summaries:
         raise ValueError("All scanned files were invalid or produced zero usable windows.")
@@ -274,35 +344,35 @@ def _collect_participant_summaries(
         if participant_id in usable_ids
     }
     filtered_cache_paths = {
-        participant_id: cache_path
-        for participant_id, cache_path in cache_paths.items()
+        participant_id: paths
+        for participant_id, paths in cache_paths.items()
         if participant_id in usable_ids
     }
-    if config.use_cache:
-        save_json(
-            {
-                "dataset_root": str(config.dataset_root),
-                "limit_files": config.limit_files,
-                "input_feature_columns": list(config.input_feature_columns),
-                "participants": [participant_summary_to_dict(summary) for summary in summaries],
-            },
-            config.participant_summary_path,
-        )
+    save_json(
+        {
+            "dataset_root": str(config.dataset_root),
+            "limit_files": config.limit_files,
+            "input_feature_columns": list(config.input_feature_columns),
+            "participants": [participant_summary_to_dict(summary) for summary in summaries],
+        },
+        config.participant_summary_path,
+    )
 
     logger.info(
         "Prepared participant summaries for %d file(s); skipped %d file(s).",
         len(summaries),
         skipped_files,
     )
-    return summaries, filtered_lookup, ParticipantStore(filtered_cache_paths, initial_cache=in_memory_cache)
+    return summaries, filtered_lookup, ParticipantStore(filtered_cache_paths), artifacts_stale
 
 
 def _load_or_create_splits(
     summaries: list[ParticipantSummary],
     config: ExperimentConfig,
     logger: logging.Logger,
+    force_rebuild: bool = False,
 ) -> ParticipantSplits:
-    if config.use_cache and config.split_path.exists() and not config.rebuild_cache:
+    if config.use_cache and config.split_path.exists() and not config.rebuild_cache and not force_rebuild:
         payload = load_json(config.split_path)
         available_ids = {summary.participant_id for summary in summaries}
         splits = load_existing_splits(payload, available_ids)
@@ -365,26 +435,99 @@ def _build_window_manifest(
     return manifest
 
 
+def _window_manifest_is_compatible(manifest: pd.DataFrame) -> bool:
+    required_columns = {
+        "split",
+        "participant_id",
+        "window_index",
+        "sequence_start_epoch",
+        "center_epoch_index",
+        "raw_label_id",
+        "final_label_id",
+    }
+    return required_columns.issubset(manifest.columns)
+
+
 def _load_or_create_window_manifest(
     participant_store: ParticipantStore,
     splits: ParticipantSplits,
     config: ExperimentConfig,
     logger: logging.Logger,
+    force_rebuild: bool = False,
 ) -> pd.DataFrame:
-    if config.use_cache and config.window_manifest_path.exists() and not config.rebuild_cache:
+    if config.use_cache and config.window_manifest_path.exists() and not config.rebuild_cache and not force_rebuild:
         manifest = pd.read_csv(config.window_manifest_path)
-        logger.info("Loaded window manifest from %s.", config.window_manifest_path)
-        return manifest
+        if _window_manifest_is_compatible(manifest):
+            logger.info("Loaded window manifest from %s.", config.window_manifest_path)
+            return manifest
+        logger.info("Rebuilding incompatible window manifest at %s.", config.window_manifest_path)
     return _build_window_manifest(participant_store, splits, config, logger)
 
 
-def _compute_feature_stats(feature_matrix: np.ndarray) -> dict[str, list[float]]:
-    means = feature_matrix.mean(axis=0, dtype=np.float64)
-    stds = np.maximum(feature_matrix.std(axis=0, dtype=np.float64), 1e-6)
+def _accumulate_feature_statistics(
+    feature_tensor: np.ndarray,
+    running_sum: np.ndarray,
+    running_squared_sum: np.ndarray,
+    running_count: int,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    if feature_tensor.ndim != 3:
+        raise ValueError(f"Expected epoch features with shape [num_epochs, channels, epoch_length], got {feature_tensor.shape}")
+
+    running_count += int(feature_tensor.shape[0] * feature_tensor.shape[2])
+    for channel_index in range(feature_tensor.shape[1]):
+        channel_values = np.asarray(feature_tensor[:, channel_index, :], dtype=np.float64)
+        running_sum[channel_index] += channel_values.sum(dtype=np.float64)
+        running_squared_sum[channel_index] += np.square(channel_values).sum(dtype=np.float64)
+    return running_sum, running_squared_sum, running_count
+
+
+def _finalize_feature_statistics(
+    running_sum: np.ndarray,
+    running_squared_sum: np.ndarray,
+    running_count: int,
+) -> dict[str, list[float]]:
+    if running_count <= 0:
+        raise ValueError("Cannot compute normalization statistics from zero feature values.")
+
+    means = running_sum / running_count
+    variances = np.maximum((running_squared_sum / running_count) - np.square(means), 1e-12)
     return {
         "mean": means.tolist(),
-        "std": stds.tolist(),
+        "std": np.sqrt(variances).tolist(),
     }
+
+
+def _compute_feature_stats(feature_tensor: np.ndarray) -> dict[str, list[float]]:
+    channel_count = feature_tensor.shape[1]
+    running_sum = np.zeros(channel_count, dtype=np.float64)
+    running_squared_sum = np.zeros(channel_count, dtype=np.float64)
+    running_sum, running_squared_sum, running_count = _accumulate_feature_statistics(
+        feature_tensor,
+        running_sum,
+        running_squared_sum,
+        0,
+    )
+    return _finalize_feature_statistics(running_sum, running_squared_sum, running_count)
+
+
+def _normalization_payload_is_compatible(
+    payload: dict[str, Any],
+    config: ExperimentConfig,
+) -> bool:
+    if payload.get("feature_columns") != list(config.input_feature_columns):
+        return False
+    if payload.get("mode") != config.normalization_mode:
+        return False
+
+    expected_channels = len(config.input_feature_columns)
+    if payload.get("mode") == "global_train":
+        return len(payload.get("mean", [])) == expected_channels and len(payload.get("std", [])) == expected_channels
+
+    participant_payload = payload.get("participants", {})
+    return all(
+        len(stats.get("mean", [])) == expected_channels and len(stats.get("std", [])) == expected_channels
+        for stats in participant_payload.values()
+    )
 
 
 def _load_or_compute_normalization_stats(
@@ -393,21 +536,30 @@ def _load_or_compute_normalization_stats(
     splits: ParticipantSplits,
     config: ExperimentConfig,
     logger: logging.Logger,
+    force_rebuild: bool = False,
 ) -> dict[str, Any]:
-    if config.use_cache and config.normalization_path.exists() and not config.rebuild_cache:
+    if config.use_cache and config.normalization_path.exists() and not config.rebuild_cache and not force_rebuild:
         payload = load_json(config.normalization_path)
-        logger.info("Loaded normalization statistics from %s.", config.normalization_path)
-        return payload
+        if _normalization_payload_is_compatible(payload, config):
+            logger.info("Loaded normalization statistics from %s.", config.normalization_path)
+            return payload
+        logger.info("Rebuilding incompatible normalization statistics at %s.", config.normalization_path)
 
     if config.normalization_mode == "global_train":
-        train_features: list[np.ndarray] = []
+        running_sum = np.zeros(len(config.input_feature_columns), dtype=np.float64)
+        running_squared_sum = np.zeros(len(config.input_feature_columns), dtype=np.float64)
+        running_count = 0
         for participant_id in splits.train:
             cleaned = participant_store.load(participant_id)
-            train_features.append(cleaned.features.astype(np.float32, copy=False))
-        if not train_features:
+            running_sum, running_squared_sum, running_count = _accumulate_feature_statistics(
+                cleaned.features,
+                running_sum,
+                running_squared_sum,
+                running_count,
+            )
+        if running_count == 0:
             raise ValueError("Zero training participants available to compute normalization statistics.")
-        feature_matrix = np.concatenate(train_features, axis=0)
-        stats = _compute_feature_stats(feature_matrix)
+        stats = _finalize_feature_statistics(running_sum, running_squared_sum, running_count)
         payload: dict[str, Any] = {
             "mode": "global_train",
             "feature_columns": list(config.input_feature_columns),
@@ -418,9 +570,7 @@ def _load_or_compute_normalization_stats(
         participant_ids = sorted(set(manifest["participant_id"].tolist()))
         for participant_id in participant_ids:
             cleaned = participant_store.load(participant_id)
-            participant_stats[participant_id] = _compute_feature_stats(
-                cleaned.features.astype(np.float32, copy=False)
-            )
+            participant_stats[participant_id] = _compute_feature_stats(cleaned.features)
         payload = {
             "mode": "participant",
             "feature_columns": list(config.input_feature_columns),
@@ -442,8 +592,9 @@ def _load_or_compute_class_stats(
     manifest: pd.DataFrame,
     config: ExperimentConfig,
     logger: logging.Logger,
+    force_rebuild: bool = False,
 ) -> tuple[list[float], list[float], list[int], list[int]]:
-    if config.use_cache and config.class_weights_path.exists() and not config.rebuild_cache:
+    if config.use_cache and config.class_weights_path.exists() and not config.rebuild_cache and not force_rebuild:
         payload = load_json(config.class_weights_path)
         logger.info("Loaded class weights from %s.", config.class_weights_path)
         return (
@@ -488,8 +639,9 @@ def _load_or_compute_transition_stats(
     manifest: pd.DataFrame,
     config: ExperimentConfig,
     logger: logging.Logger,
+    force_rebuild: bool = False,
 ) -> tuple[list[list[float]], list[float]]:
-    if config.use_cache and config.transition_matrix_path.exists() and not config.rebuild_cache:
+    if config.use_cache and config.transition_matrix_path.exists() and not config.rebuild_cache and not force_rebuild:
         payload = load_json(config.transition_matrix_path)
         logger.info("Loaded transition statistics from %s.", config.transition_matrix_path)
         return (
@@ -537,31 +689,6 @@ def _load_or_compute_transition_stats(
     return transition_matrix.tolist(), priors.tolist()
 
 
-def _stats_for_participant(
-    normalization_stats: dict[str, Any],
-    participant_id: str,
-) -> dict[str, Any]:
-    if normalization_stats["mode"] == "global_train":
-        return normalization_stats
-    return normalization_stats["participants"][participant_id]
-
-
-def _reshape_epoch_sequences(features: np.ndarray, config: ExperimentConfig) -> np.ndarray:
-    if features.shape[2] != config.context_window_size:
-        raise ValueError(
-            "Unexpected sequence length for epoch reshaping: "
-            f"expected {config.context_window_size}, got {features.shape[2]}"
-        )
-    num_windows, num_channels, _ = features.shape
-    reshaped = features.reshape(
-        num_windows,
-        num_channels,
-        config.context_length_epochs,
-        config.center_window_size,
-    )
-    return np.transpose(reshaped, (0, 2, 1, 3))
-
-
 def _prepare_split_arrays(
     split_name: str,
     manifest: pd.DataFrame,
@@ -574,11 +701,12 @@ def _prepare_split_arrays(
     if split_manifest.empty:
         raise ValueError(f"Split '{split_name}' produced zero usable windows.")
 
-    logger.info("Using memmapped participant cache for split '%s'", split_name)
+    logger.info("Using memmapped participant cache for split '%s'.", split_name)
 
-    cache_paths = participant_store.cache_paths
-
-    split_manifest_sorted = split_manifest.sort_values("window_index", kind="mergesort")
+    split_manifest_sorted = split_manifest.sort_values(
+        ["participant_id", "window_index"],
+        kind="mergesort",
+    ).reset_index(drop=True)
     metadata = split_manifest_sorted.to_dict(orient="records")
 
     raw_labels = split_manifest_sorted["raw_label_id"].to_numpy(dtype=np.int64)
@@ -589,7 +717,7 @@ def _prepare_split_arrays(
 
     dataset = EpochSequenceDataset(
         manifest=split_manifest_sorted,
-        participant_cache_paths=cache_paths,
+        participant_cache_paths=participant_store.cache_paths,
         normalization_stats=normalization_stats,
         config=config,
     )
@@ -614,7 +742,8 @@ def prepare_datasets(
     config.validate()
     config.ensure_output_dirs()
 
-    logger.info("Using filtered columns: TEMP, ACC_X, ACC_Y, ACC_Z, HR")
+    logger.info("Using filtered columns: TEMP, ACC, HR")
+    logger.info("Canonical feature order: TEMP, ACC_X, ACC_Y, ACC_Z, HR")
     logger.info("Total channels after filtering: 5")
 
     participant_files = scan_dataset_files(
@@ -622,26 +751,39 @@ def prepare_datasets(
         logger=logger,
         limit_files=config.limit_files,
     )
-    summaries, participant_lookup, participant_store = _collect_participant_summaries(
+    summaries, participant_lookup, participant_store, artifacts_stale = _collect_participant_summaries(
         participant_files,
         config,
         logger,
     )
-    splits = _load_or_create_splits(summaries, config, logger)
-    window_manifest = _load_or_create_window_manifest(participant_store, splits, config, logger)
+    splits = _load_or_create_splits(summaries, config, logger, force_rebuild=artifacts_stale)
+    window_manifest = _load_or_create_window_manifest(
+        participant_store,
+        splits,
+        config,
+        logger,
+        force_rebuild=artifacts_stale,
+    )
     normalization_stats = _load_or_compute_normalization_stats(
         participant_store=participant_store,
         manifest=window_manifest,
         splits=splits,
         config=config,
         logger=logger,
+        force_rebuild=artifacts_stale,
     )
     final_class_weights, raw_class_weights, final_class_counts, raw_class_counts = _load_or_compute_class_stats(
         window_manifest,
         config,
         logger,
+        force_rebuild=artifacts_stale,
     )
-    transition_matrix, class_priors = _load_or_compute_transition_stats(window_manifest, config, logger)
+    transition_matrix, class_priors = _load_or_compute_transition_stats(
+        window_manifest,
+        config,
+        logger,
+        force_rebuild=artifacts_stale,
+    )
 
     prepared_splits: dict[str, PreparedSplitData] = {}
     for split_name in requested_splits:
