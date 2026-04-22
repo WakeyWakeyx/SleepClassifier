@@ -47,14 +47,15 @@ def create_dataloader(
 ) -> DataLoader:
     """Create a DataLoader with the project's default runtime options."""
 
+    effective_num_workers = 0
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle if sampler is None else False,
         sampler=sampler,
-        num_workers=num_workers,
-        pin_memory=device.type == "cuda",
-        persistent_workers=num_workers > 0,
+        num_workers=effective_num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=False,
     )
 
 
