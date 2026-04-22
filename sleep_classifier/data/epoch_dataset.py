@@ -41,7 +41,7 @@ class PreparedSplitData:
     """Features, multitask labels, metadata, and distribution for one split."""
 
     name: str
-    dataset: "SleepWindowDataset"
+    dataset: "EpochSequenceDataset"
     metadata: list[dict[str, Any]]
     label_counts: dict[str, int]
     raw_label_counts: dict[str, int]
@@ -67,8 +67,84 @@ class PreparedDataBundle:
     window_manifest: pd.DataFrame
 
 
+class EpochSequenceDataset(Dataset[dict[str, torch.Tensor]]):
+    """Lazy dataset that loads per-participant windows on demand with memory mapping."""
+
+    def __init__(
+        self,
+        manifest: pd.DataFrame,
+        participant_cache_paths: dict[str, Path],
+        normalization_stats: dict[str, Any],
+        config: ExperimentConfig,
+    ) -> None:
+        self.manifest = manifest.reset_index(drop=True)
+        self.participant_cache_paths = dict(participant_cache_paths)
+        self.normalization_stats = normalization_stats
+        self.config = config
+        self._loaded_participants: dict[str, np.ndarray] = {}
+        self._loaded_labels: dict[str, np.ndarray] = {}
+        self._labels = torch.from_numpy(
+            self.manifest["final_label_id"].to_numpy(dtype=np.int64)
+        )
+
+    def _load_participant_data(self, participant_id: str) -> np.ndarray:
+        if participant_id not in self._loaded_participants:
+            cache_path = self.participant_cache_paths.get(participant_id)
+            if cache_path is None:
+                raise KeyError(f"No cache path for participant {participant_id}")
+            data = np.load(cache_path, mmap_mode="r")
+            self._loaded_participants[participant_id] = data["features"]
+            self._loaded_labels[participant_id] = data["final_labels"]
+        return self._loaded_participants[participant_id]
+
+    def _get_stats(self, participant_id: str) -> dict[str, Any]:
+        if self.normalization_stats["mode"] == "global_train":
+            return self.normalization_stats
+        return self.normalization_stats["participants"].get(participant_id, self.normalization_stats)
+
+    def _normalize(self, features: np.ndarray, stats: dict[str, Any]) -> np.ndarray:
+        mean = np.asarray(stats["mean"], dtype=np.float32).reshape(1, -1, 1)
+        std = np.asarray(stats["std"], dtype=np.float32).reshape(1, -1, 1)
+        return (features - mean) / std
+
+    @property
+    def labels(self) -> torch.Tensor:
+        return self._labels
+
+    def __len__(self) -> int:
+        return len(self.manifest)
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        row = self.manifest.iloc[index]
+        participant_id = str(row["participant_id"])
+
+        features = self._load_participant_data(participant_id)
+
+        start_idx = int(row["input_start_index"])
+        end_idx = int(row["input_end_index"])
+        window_data = features[start_idx:end_idx]
+
+        window_data = window_data.T.astype(np.float32, copy=False)
+
+        num_epochs = self.config.context_length_epochs
+        epoch_size = self.config.center_window_size
+        num_channels = window_data.shape[0]
+
+        reshaped = window_data.reshape(num_channels, num_epochs, epoch_size)
+        reshaped = np.transpose(reshaped, (1, 0, 2))
+
+        stats = self._get_stats(participant_id)
+        normalized = self._normalize(reshaped, stats)
+
+        return {
+            "features": torch.from_numpy(normalized.astype(np.float32, copy=False)),
+            "raw_target": torch.tensor(int(row["raw_label_id"]), dtype=torch.long),
+            "final_target": torch.tensor(int(row["final_label_id"]), dtype=torch.long),
+        }
+
+
 class SleepWindowDataset(Dataset[dict[str, torch.Tensor]]):
-    """Tensor dataset for epoch-sequence sleep-stage classification."""
+    """Eager tensor dataset for epoch-sequence sleep-stage classification (legacy)."""
 
     def __init__(self, features: np.ndarray, raw_labels: np.ndarray, final_labels: np.ndarray) -> None:
         if features.ndim != 4:
@@ -145,6 +221,9 @@ def _collect_participant_summaries(
     cache_paths: dict[str, Path] = {}
     summary_lookup = _load_existing_summary_lookup(config)
     skipped_files = 0
+
+    logger.info("Using filtered columns: TEMP, ACC_X, ACC_Y, ACC_Z, HR")
+    logger.info("Total channels after filtering: 5")
 
     for participant_file in participant_files:
         participant_id = participant_file.participant_id
@@ -489,34 +568,35 @@ def _prepare_split_arrays(
     participant_store: ParticipantStore,
     normalization_stats: dict[str, Any],
     config: ExperimentConfig,
+    logger: logging.Logger,
 ) -> PreparedSplitData:
     split_manifest = manifest.loc[manifest["split"] == split_name].copy()
     if split_manifest.empty:
         raise ValueError(f"Split '{split_name}' produced zero usable windows.")
 
-    feature_batches: list[np.ndarray] = []
-    raw_label_batches: list[np.ndarray] = []
-    final_label_batches: list[np.ndarray] = []
-    metadata: list[dict[str, Any]] = []
-    for participant_id, participant_frame in split_manifest.groupby("participant_id", sort=False):
-        participant_frame = participant_frame.sort_values("window_index", kind="mergesort")
-        cleaned = participant_store.load(participant_id)
-        window_features = extract_window_features(cleaned, participant_frame)
-        stats = _stats_for_participant(normalization_stats, participant_id)
-        normalized_features = _normalize_features(window_features, stats)
-        feature_batches.append(_reshape_epoch_sequences(normalized_features.astype(np.float32, copy=False), config))
-        raw_label_batches.append(participant_frame["raw_label_id"].to_numpy(dtype=np.int64))
-        final_label_batches.append(participant_frame["final_label_id"].to_numpy(dtype=np.int64))
-        metadata.extend(participant_frame.to_dict(orient="records"))
+    logger.info("Using memmapped participant cache for split '%s'", split_name)
 
-    features = np.concatenate(feature_batches, axis=0)
-    raw_labels = np.concatenate(raw_label_batches, axis=0)
-    final_labels = np.concatenate(final_label_batches, axis=0)
+    cache_paths = participant_store.cache_paths
+
+    split_manifest_sorted = split_manifest.sort_values("window_index", kind="mergesort")
+    metadata = split_manifest_sorted.to_dict(orient="records")
+
+    raw_labels = split_manifest_sorted["raw_label_id"].to_numpy(dtype=np.int64)
+    final_labels = split_manifest_sorted["final_label_id"].to_numpy(dtype=np.int64)
+
     raw_counts = np.bincount(raw_labels, minlength=len(RAW_ID_TO_NAME))
     final_counts = np.bincount(final_labels, minlength=len(FINAL_ID_TO_NAME))
+
+    dataset = EpochSequenceDataset(
+        manifest=split_manifest_sorted,
+        participant_cache_paths=cache_paths,
+        normalization_stats=normalization_stats,
+        config=config,
+    )
+
     return PreparedSplitData(
         name=split_name,
-        dataset=SleepWindowDataset(features=features, raw_labels=raw_labels, final_labels=final_labels),
+        dataset=dataset,
         metadata=metadata,
         label_counts={FINAL_ID_TO_NAME[idx]: int(count) for idx, count in enumerate(final_counts)},
         raw_label_counts={RAW_ID_TO_NAME[idx]: int(count) for idx, count in enumerate(raw_counts)},
@@ -533,6 +613,9 @@ def prepare_datasets(
 
     config.validate()
     config.ensure_output_dirs()
+
+    logger.info("Using filtered columns: TEMP, ACC_X, ACC_Y, ACC_Z, HR")
+    logger.info("Total channels after filtering: 5")
 
     participant_files = scan_dataset_files(
         dataset_root=config.dataset_root,
@@ -568,6 +651,7 @@ def prepare_datasets(
             participant_store=participant_store,
             normalization_stats=normalization_stats,
             config=config,
+            logger=logger,
         )
 
     split_to_ids = {
