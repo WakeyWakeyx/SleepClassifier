@@ -11,6 +11,14 @@ from torch import nn
 from sleep_classifier.experiment_config import ExperimentConfig
 
 
+BRANCH_INPUT_FEATURES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("bvp", ("BVP", "BVP_DELTA")),
+    ("acc", ("ACC_X", "ACC_Y", "ACC_Z", "ACC_MAG")),
+    ("autonomic", ("EDA", "TEMP", "EDA_SLOPE", "TEMP_SLOPE", "EDA_DELTA", "TEMP_DELTA")),
+    ("cardio", ("HR", "IBI", "IBI_ROLLING_STD")),
+)
+
+
 def _unique_present_features(feature_names: Iterable[str], feature_to_index: dict[str, int]) -> list[str]:
     ordered: list[str] = []
     for feature_name in feature_names:
@@ -263,49 +271,62 @@ class ModalityAwareEpochSequenceModel(nn.Module):
         self.feature_to_index = {name: idx for idx, name in enumerate(self.feature_columns)}
         self.use_multi_branch = config.use_multi_branch
         self.use_multitask_heads = config.use_multitask_heads
+        self.active_branch_names: tuple[str, ...] = ()
 
         if self.use_multi_branch:
-            bvp_features = _unique_present_features(("BVP", "BVP_DELTA"), self.feature_to_index)
-            acc_features = _unique_present_features(("ACC_X", "ACC_Y", "ACC_Z", "ACC_MAG"), self.feature_to_index)
-            autonomic_features = _unique_present_features(
-                ("EDA", "TEMP", "EDA_SLOPE", "TEMP_SLOPE", "EDA_DELTA", "TEMP_DELTA"),
-                self.feature_to_index,
-            )
-            cardio_features = _unique_present_features(("HR", "IBI", "IBI_ROLLING_STD"), self.feature_to_index)
-
             self.branch_feature_names = {
-                "bvp": bvp_features,
-                "acc": acc_features,
-                "autonomic": autonomic_features,
-                "cardio": cardio_features,
+                branch_name: _unique_present_features(feature_names, self.feature_to_index)
+                for branch_name, feature_names in BRANCH_INPUT_FEATURES
             }
-            self.bvp_encoder = WaveformEpochEncoder(
-                input_channels=len(bvp_features),
-                base_channels=config.model_base_channels,
-                embedding_dim=config.branch_embedding_dim,
-                dropout=config.dropout,
-                downsample_factor=1,
+            self.active_branch_names = tuple(
+                branch_name
+                for branch_name, feature_names in self.branch_feature_names.items()
+                if feature_names
             )
-            self.acc_encoder = WaveformEpochEncoder(
-                input_channels=len(acc_features),
-                base_channels=config.model_base_channels,
-                embedding_dim=config.branch_embedding_dim,
-                dropout=config.dropout,
-                downsample_factor=2,
-            )
-            self.autonomic_encoder = WaveformEpochEncoder(
-                input_channels=len(autonomic_features),
-                base_channels=max(config.model_base_channels // 2, 16),
-                embedding_dim=config.branch_embedding_dim,
-                dropout=config.dropout,
-                downsample_factor=32,
-            )
-            self.cardio_encoder = SummaryEpochEncoder(
-                input_channels=len(cardio_features),
-                embedding_dim=config.branch_embedding_dim,
-                dropout=config.dropout,
-            )
-            fusion_input_dim = config.branch_embedding_dim * 4
+            if not self.active_branch_names:
+                raise ValueError(
+                    "Multi-branch epoch encoder requires at least one supported modality; "
+                    f"received input features {self.feature_columns}."
+                )
+
+            self.branch_encoders = nn.ModuleDict()
+            for branch_name in self.active_branch_names:
+                branch_feature_count = len(self.branch_feature_names[branch_name])
+                if branch_name == "bvp":
+                    encoder = WaveformEpochEncoder(
+                        input_channels=branch_feature_count,
+                        base_channels=config.model_base_channels,
+                        embedding_dim=config.branch_embedding_dim,
+                        dropout=config.dropout,
+                        downsample_factor=1,
+                    )
+                elif branch_name == "acc":
+                    encoder = WaveformEpochEncoder(
+                        input_channels=branch_feature_count,
+                        base_channels=config.model_base_channels,
+                        embedding_dim=config.branch_embedding_dim,
+                        dropout=config.dropout,
+                        downsample_factor=2,
+                    )
+                elif branch_name == "autonomic":
+                    encoder = WaveformEpochEncoder(
+                        input_channels=branch_feature_count,
+                        base_channels=max(config.model_base_channels // 2, 16),
+                        embedding_dim=config.branch_embedding_dim,
+                        dropout=config.dropout,
+                        downsample_factor=32,
+                    )
+                elif branch_name == "cardio":
+                    encoder = SummaryEpochEncoder(
+                        input_channels=branch_feature_count,
+                        embedding_dim=config.branch_embedding_dim,
+                        dropout=config.dropout,
+                    )
+                else:  # pragma: no cover - BRANCH_INPUT_FEATURES is static
+                    raise ValueError(f"Unsupported branch '{branch_name}'.")
+                self.branch_encoders[branch_name] = encoder
+
+            fusion_input_dim = config.branch_embedding_dim * len(self.active_branch_names)
             self.epoch_fusion = nn.Sequential(
                 nn.LayerNorm(fusion_input_dim),
                 nn.Linear(fusion_input_dim, config.epoch_embedding_dim),
@@ -344,26 +365,37 @@ class ModalityAwareEpochSequenceModel(nn.Module):
         self.raw_head = nn.Linear(config.epoch_embedding_dim, raw_num_classes)
 
     def _select_features(self, inputs: torch.Tensor, feature_names: list[str]) -> torch.Tensor:
+        if not feature_names:
+            raise ValueError("Attempted to select an empty feature set for an inactive encoder branch.")
+        missing_features = [name for name in feature_names if name not in self.feature_to_index]
+        if missing_features:
+            raise ValueError(
+                f"Requested features {missing_features} are not available in model inputs {self.feature_columns}."
+            )
+
         indices = [self.feature_to_index[name] for name in feature_names]
-        return inputs[:, indices, :]
+        selected = inputs[:, indices, :]
+        if selected.size(1) != len(feature_names):
+            raise RuntimeError(
+                "Feature selection produced an unexpected channel count: "
+                f"expected {len(feature_names)}, got {selected.size(1)}."
+            )
+        return selected
 
     def _encode_epochs(self, inputs: torch.Tensor) -> torch.Tensor:
         batch_size, num_epochs, num_channels, epoch_length = inputs.shape
         flattened = inputs.reshape(batch_size * num_epochs, num_channels, epoch_length)
 
         if self.use_multi_branch:
-            bvp_embedding = self.bvp_encoder(self._select_features(flattened, self.branch_feature_names["bvp"]))
-            acc_embedding = self.acc_encoder(self._select_features(flattened, self.branch_feature_names["acc"]))
-            autonomic_embedding = self.autonomic_encoder(
-                self._select_features(flattened, self.branch_feature_names["autonomic"])
-            )
-            cardio_embedding = self.cardio_encoder(
-                self._select_features(flattened, self.branch_feature_names["cardio"])
-            )
-            fused = torch.cat(
-                [bvp_embedding, acc_embedding, autonomic_embedding, cardio_embedding],
-                dim=1,
-            )
+            branch_embeddings = [
+                self.branch_encoders[branch_name](
+                    self._select_features(flattened, self.branch_feature_names[branch_name])
+                )
+                for branch_name in self.active_branch_names
+            ]
+            if not branch_embeddings:
+                raise RuntimeError("No active encoder branches were available for the configured input features.")
+            fused = torch.cat(branch_embeddings, dim=1)
             epoch_embeddings = self.epoch_fusion(fused)
         else:
             epoch_embeddings = self.single_encoder(flattened)
