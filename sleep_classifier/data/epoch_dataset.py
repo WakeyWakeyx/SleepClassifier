@@ -232,6 +232,14 @@ class ParticipantStore:
         return self._loaded[participant_id]
 
 
+def _log_feature_configuration(config: ExperimentConfig, logger: logging.Logger) -> None:
+    filtered_columns = ", ".join(config.filtered_sensor_names)
+    canonical_feature_order = ", ".join(config.canonical_feature_order)
+    logger.info("Using filtered columns: %s", filtered_columns)
+    logger.info("Canonical feature order: %s", canonical_feature_order)
+    logger.info("Total channels after filtering: %d", len(config.input_feature_columns))
+
+
 def _load_existing_summary_lookup(config: ExperimentConfig) -> dict[str, ParticipantSummary]:
     if not config.use_cache or config.rebuild_cache or not config.participant_summary_path.exists():
         return {}
@@ -298,9 +306,7 @@ def _collect_participant_summaries(
     skipped_files = 0
     artifacts_stale = bool(config.rebuild_cache)
 
-    logger.info("Using filtered columns: TEMP, ACC, HR")
-    logger.info("Canonical feature order: TEMP, ACC_X, ACC_Y, ACC_Z, HR")
-    logger.info("Total channels after filtering: 5")
+    _log_feature_configuration(config, logger)
 
     for participant_file in participant_files:
         participant_id = participant_file.participant_id
@@ -742,9 +748,7 @@ def prepare_datasets(
     config.validate()
     config.ensure_output_dirs()
 
-    logger.info("Using filtered columns: TEMP, ACC, HR")
-    logger.info("Canonical feature order: TEMP, ACC_X, ACC_Y, ACC_Z, HR")
-    logger.info("Total channels after filtering: 5")
+    _log_feature_configuration(config, logger)
 
     participant_files = scan_dataset_files(
         dataset_root=config.dataset_root,
