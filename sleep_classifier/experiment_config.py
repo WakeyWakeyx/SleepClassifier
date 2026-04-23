@@ -9,12 +9,30 @@ from pathlib import Path
 from typing import Any
 
 
+SUPPORTED_FEATURE_COLUMNS: tuple[str, ...] = (
+    "BVP",
+    "IBI",
+    "EDA",
+    "TEMP",
+    "ACC_X",
+    "ACC_Y",
+    "ACC_Z",
+    "HR",
+)
 FILTERED_FEATURE_COLUMNS: tuple[str, ...] = (
     "TEMP",
     "ACC_X",
     "ACC_Y",
     "ACC_Z",
     "HR",
+)
+SENSOR_TO_FEATURE_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("BVP", ("BVP",)),
+    ("IBI", ("IBI",)),
+    ("EDA", ("EDA",)),
+    ("TEMP", ("TEMP",)),
+    ("ACC", ("ACC_X", "ACC_Y", "ACC_Z")),
+    ("HR", ("HR",)),
 )
 PARTICIPANT_CACHE_DIRNAME = "participants"
 LEGACY_PARTICIPANT_CACHE_DIRNAME = "cleaned_participants"
@@ -123,6 +141,20 @@ class ExperimentConfig:
         if not self.use_derived_features:
             return self.feature_columns
         return self.feature_columns + self.derived_feature_columns
+
+    @property
+    def canonical_feature_order(self) -> tuple[str, ...]:
+        active_features = set(self.feature_columns)
+        return tuple(feature_name for feature_name in SUPPORTED_FEATURE_COLUMNS if feature_name in active_features)
+
+    @property
+    def filtered_sensor_names(self) -> tuple[str, ...]:
+        active_features = set(self.feature_columns)
+        return tuple(
+            sensor_name
+            for sensor_name, sensor_features in SENSOR_TO_FEATURE_COLUMNS
+            if any(feature_name in active_features for feature_name in sensor_features)
+        )
 
     @property
     def center_window_size(self) -> int:
@@ -316,15 +348,28 @@ class ExperimentConfig:
             raise ValueError("epochs must be positive.")
         if self.num_workers < 0:
             raise ValueError("num_workers cannot be negative.")
-        if tuple(self.feature_columns) != FILTERED_FEATURE_COLUMNS:
+        if not self.feature_columns:
+            raise ValueError("At least one input feature column must be configured.")
+        if len(set(self.feature_columns)) != len(self.feature_columns):
+            raise ValueError("feature_columns must not contain duplicates.")
+        unsupported_feature_columns = [
+            feature_name for feature_name in self.feature_columns if feature_name not in SUPPORTED_FEATURE_COLUMNS
+        ]
+        if unsupported_feature_columns:
             raise ValueError(
-                "Epoch-sequence training only supports the canonical filtered feature order "
-                f"{list(FILTERED_FEATURE_COLUMNS)}."
+                "Epoch-sequence training only supports wearable features from "
+                f"{list(SUPPORTED_FEATURE_COLUMNS)}; received unsupported features "
+                f"{unsupported_feature_columns}."
+            )
+        if tuple(self.feature_columns) != self.canonical_feature_order:
+            raise ValueError(
+                "feature_columns must be a non-empty ordered subset of "
+                f"{list(SUPPORTED_FEATURE_COLUMNS)}; received {list(self.feature_columns)}."
             )
         if self.use_derived_features:
             raise ValueError(
                 "Derived features are disabled for the epoch-sequence pipeline; "
-                "only TEMP, ACC_X, ACC_Y, ACC_Z, and HR may be used."
+                f"configure only base wearable columns from {list(SUPPORTED_FEATURE_COLUMNS)}."
             )
         if self.normalization_mode not in SUPPORTED_NORMALIZATION_MODES:
             raise ValueError(
