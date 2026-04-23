@@ -144,13 +144,7 @@ python train.py --dataset-root data_64Hz --output-dir artifacts\baseline_run
 Helpful overrides:
 
 ```bash
-python train.py ^
-  --dataset-root data_64Hz ^
-  --output-dir artifacts\baseline_run ^
-  --batch-size 64 ^
-  --epochs 25 ^
-  --num-workers 0 ^
-  --stride-seconds 30
+python train.py --dataset-root D:\Dreamt\data_64Hz --output-dir artifacts\baseline_run --batch-size 64 --epochs 25 --num-workers 0 --stride-seconds 30
 ```
 
 Features:
